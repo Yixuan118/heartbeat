@@ -1,0 +1,39 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>动态心跳模拟器</title>
+    <style>
+        /* 您可以添加一些样式 */
+        body { font-family: sans-serif; text-align: center; padding: 20px; }
+        .control-group { margin: 15px; }
+        label { margin-right: 10px; }
+        input { width: 80px; }
+        button { margin: 5px; padding: 10px 15px; }
+        #status { margin-top: 20px; color: #555; }
+    </style>
+</head>
+<body>
+    <h1>动态心跳模拟器</h1>
+
+    <div class="control-group">
+        <label for="bpmInput">心率 (bpm):</label>
+        <input type="number" id="bpmInput" value="75">
+    </div>
+
+    <div class="control-group">
+        <label for="durationInput">持续时间 (分钟):</label>
+        <input type="number" id="durationInput" value="1">
+    </div>
+
+    <div>
+        <button id="startButton">开始模拟</button>
+        <button id="stopButton">停止模拟</button>
+    </div>
+
+    <div id="status">请连接游戏手柄，并按任意键激活...</div>
+
+    <script src="newheartbeat.js"></script>
+</body>
+</html>
