@@ -1,0 +1,206 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>循环 Chirp 振动生成器</title>
+  <style>
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+      text-align: center;
+      padding: 1.5em;
+      background-color: #f8f9fa;
+      color: #343a40;
+    }
+    h1 {
+      color: #0056b3;
+    }
+    .container {
+      max-width: 600px;
+      margin: auto;
+      background: #ffffff;
+      padding: 2em;
+      border-radius: 12px;
+      box-shadow: 0 4px 12px rgba(0,0,0,0.1);
+    }
+    .control-group {
+      margin-bottom: 1.2em;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+    }
+    label {
+      font-size: 1.1em;
+      text-align: left;
+    }
+    input[type="number"] {
+      font-size: 1.1em;
+      padding: 0.5em;
+      width: 80px;
+      border: 1px solid #ced4da;
+      border-radius: 5px;
+      text-align: center;
+    }
+    button {
+      font-size: 1.2em;
+      padding: 0.7em 1.5em;
+      margin: 0.5em;
+      border: none;
+      border-radius: 8px;
+      cursor: pointer;
+      color: white;
+      transition: background-color 0.2s;
+    }
+    #startButton {
+      background-color: #28a745;
+    }
+    #startButton:hover {
+      background-color: #218838;
+    }
+    #stopButton {
+      background-color: #dc3545;
+    }
+    #stopButton:hover {
+      background-color: #c82333;
+    }
+    #log {
+      margin-top: 1.5em;
+      padding: 1em;
+      background: #e9ecef;
+      border-radius: 8px;
+      font-family: monospace;
+      min-height: 40px;
+      text-align: center;
+    }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <h1>循环 Chirp 振动器 🌀</h1>
+
+    <div class="control-group">
+      <label for="startFreq">起始频率 (Hz):</label>
+      <input type="number" id="startFreq" value="2" min="0" max="80">
+    </div>
+    <div class="control-group">
+      <label for="endFreq">结束频率 (Hz):</label>
+      <input type="number" id="endFreq" value="20" min="0" max="80">
+    </div>
+    <div class="control-group">
+      <label for="cycleDuration">单周期时长 (秒):</label>
+      <input type="number" id="cycleDuration" value="3" min="1" max="60">
+    </div>
+    <div class="control-group">
+      <label for="shapeK">波形曲率 (k):</label>
+      <input type="number" id="shapeK" value="2" min="0.1" max="5" step="0.1">
+    </div>
+
+    <div>
+      <button id="startButton" onclick="startChirpLoop()">开始循环</button>
+      <button id="stopButton" onclick="stopChirpLoop()">停止</button>
+    </div>
+
+    <div id="log">请点击“开始循环”</div>
+  </div>
+
+  <script>
+    let chirpIntervalId = null;
+
+    // 更新日志信息
+    function logMessage(msg) {
+      document.getElementById('log').textContent = msg;
+    }
+
+    // 开始循环播放 Chirp 振动
+    function startChirpLoop() {
+      if (chirpIntervalId) {
+        stopChirpLoop();
+      }
+
+      if (!('vibrate' in navigator)) {
+        logMessage("错误: 您的浏览器不支持振动功能。");
+        return;
+      }
+
+      const startFreq = parseFloat(document.getElementById('startFreq').value);
+      const endFreq = parseFloat(document.getElementById('endFreq').value);
+      const cycleDurationSec = parseFloat(document.getElementById('cycleDuration').value);
+      const k = parseFloat(document.getElementById('shapeK').value);
+
+      if (isNaN(startFreq) || isNaN(endFreq) || isNaN(cycleDurationSec) || isNaN(k) || cycleDurationSec <= 0) {
+        alert("请输入所有有效的数值！");
+        return;
+      }
+
+      const cycleDurationMs = cycleDurationSec * 1000;
+      const chirpPattern = generateChirpCyclePattern(startFreq, endFreq, cycleDurationMs, k);
+
+      if (chirpPattern.length === 0) {
+        logMessage("无法生成振动模式，请检查频率设置。");
+        return;
+      }
+
+      navigator.vibrate(chirpPattern);
+      logMessage(`循环已开始: ${startFreq}Hz -> ${endFreq}Hz, 周期 ${cycleDurationSec}s`);
+
+      const loopInterval = cycleDurationMs + 100; // 每周期间增加100ms暂停
+      chirpIntervalId = setInterval(() => {
+        navigator.vibrate(chirpPattern);
+      }, loopInterval);
+    }
+
+    // 停止振动和循环
+    function stopChirpLoop() {
+      if (chirpIntervalId) {
+        clearInterval(chirpIntervalId);
+        chirpIntervalId = null;
+      }
+      navigator.vibrate(0);
+      logMessage("振动已停止。");
+    }
+
+    // 生成单周期的 Chirp 振动模式
+    function generateChirpCyclePattern(startFreq, endFreq, durationMs, k) {
+      const pattern = [];
+      let currentTime = 0;
+      const timeStep = 20; // 时间步长，单位ms
+      const minPeriodMs = 5; // 最小周期，防止频率过高
+
+      while (currentTime < durationMs) {
+        const progress = currentTime / durationMs;
+        const instantaneousFreq = startFreq + (endFreq - startFreq) * Math.pow(progress, k);
+
+        let periodMs;
+        if (instantaneousFreq > 0) {
+          periodMs = 1000 / instantaneousFreq;
+        } else {
+          periodMs = durationMs; // 频率为0时视为暂停
+        }
+
+        periodMs = Math.max(periodMs, minPeriodMs);
+
+        const vibrationTime = Math.round(periodMs / 2);
+        const pauseTime = Math.round(periodMs - vibrationTime);
+
+        if (vibrationTime > 0) {
+          pattern.push(vibrationTime);
+          if (pauseTime > 0) {
+            pattern.push(pauseTime);
+          }
+        } else if (pauseTime > 0) {
+          if (pattern.length > 0 && pattern.length % 2 === 0) {
+            pattern[pattern.length - 1] += pauseTime;
+          } else {
+            pattern.push(0);
+            pattern.push(pauseTime);
+          }
+        }
+
+        currentTime += (vibrationTime + pauseTime);
+      }
+
+      return pattern;
+    }
+  </script>
+</body>
+</html>
