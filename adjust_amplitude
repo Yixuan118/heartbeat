@@ -1,0 +1,552 @@
+import numpy as np
+import torch
+import torch.nn as nn
+from torch.utils.data import Dataset, DataLoader
+import torch.optim as optim
+import matplotlib.pyplot as plt
+from scipy.signal import find_peaks
+
+
+# ===================== 1. 数据集定义 =====================
+class SignalDataset(Dataset):
+    def __init__(self, atten_signals, raw_signals, segment_length=1024, is_train=True, scale_range=(1, 100)):
+        self.atten_signals = atten_signals
+        self.raw_signals = raw_signals
+        self.segment_length = segment_length
+        self.is_train = is_train
+        self.scale_range = scale_range
+
+    def __len__(self):
+        return len(self.atten_signals)
+
+    def __getitem__(self, idx):
+        x = np.array(self.atten_signals[idx]).astype(np.float32)
+        y = np.array(self.raw_signals[idx]).astype(np.float32)
+        # 裁剪或填充到固定长度
+        if len(x) > self.segment_length:
+            x = x[:self.segment_length]
+            y = y[:self.segment_length]
+        else:
+            pad = self.segment_length - len(x)
+            x = np.pad(x, (0, pad), 'edge')
+            y = np.pad(y, (0, pad), 'edge')
+        # 训练时做输入和输出的幅度扩展
+        if self.is_train:
+            prob = np.random.rand()
+            if prob < 0.5:
+                scale = np.random.uniform(50, 100)
+            else:
+                log_min = np.log(self.scale_range[0])
+                log_max = np.log(self.scale_range[1])
+                scale = np.exp(np.random.uniform(log_min, log_max))
+            x = x * scale
+            y = y * scale
+        # 只对输入归一化，输出保持原始幅度
+        x_mean, x_std = np.mean(x), np.std(x) + 1e-8
+        x_norm = (x - x_mean) / x_std
+        return torch.from_numpy(x_norm), torch.from_numpy(y), x_mean, x_std
+
+
+# ===================== 2. U-Net1D模型 =====================
+class DoubleConv(nn.Module):
+    def __init__(self, in_channels, out_channels, mid_channels=None):
+        super().__init__()
+        if not mid_channels:
+            mid_channels = out_channels
+        self.double_conv = nn.Sequential(
+            nn.Conv1d(in_channels, mid_channels, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm1d(mid_channels),
+            nn.ReLU(inplace=True),
+            nn.Conv1d(mid_channels, out_channels, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm1d(out_channels),
+            nn.ReLU(inplace=True)
+        )
+
+    def forward(self, x):
+        return self.double_conv(x)
+
+
+class Down(nn.Module):
+    def __init__(self, in_channels, out_channels):
+        super().__init__()
+        self.maxpool_conv = nn.Sequential(
+            nn.MaxPool1d(2),
+            DoubleConv(in_channels, out_channels)
+        )
+
+    def forward(self, x):
+        return self.maxpool_conv(x)
+
+
+class Up(nn.Module):
+    def __init__(self, in_channels, out_channels, bilinear=True):
+        super().__init__()
+        if bilinear:
+            self.up = nn.Upsample(scale_factor=2, mode='linear', align_corners=True)
+            self.conv = DoubleConv(in_channels, out_channels, in_channels // 2)
+        else:
+            self.up = nn.ConvTranspose1d(in_channels, in_channels // 2, kernel_size=2, stride=2)
+            self.conv = DoubleConv(in_channels, out_channels)
+
+    def forward(self, x1, x2):
+        x1 = self.up(x1)
+        diff = x2.size()[2] - x1.size()[2]
+        x1 = nn.functional.pad(x1, [diff // 2, diff - diff // 2])
+        x = torch.cat([x2, x1], dim=1)
+        return self.conv(x)
+
+
+class OutConv(nn.Module):
+    def __init__(self, in_channels, out_channels):
+        super().__init__()
+        self.conv = nn.Conv1d(in_channels, out_channels, kernel_size=1)
+
+    def forward(self, x):
+        return self.conv(x)
+
+
+class UNet1D(nn.Module):
+    def __init__(self, n_channels=1, n_classes=1, bilinear=True):
+        super().__init__()
+        self.n_channels = n_channels
+        self.n_classes = n_classes
+        self.bilinear = bilinear
+        factor = 2 if bilinear else 1
+        self.inc = DoubleConv(n_channels, 64)
+        self.down1 = Down(64, 128)
+        self.down2 = Down(128, 256)
+        self.down3 = Down(256, 512)
+        self.down4 = Down(512, 1024 // factor)
+        self.up1 = Up(1024, 512 // factor, bilinear)
+        self.up2 = Up(512, 256 // factor, bilinear)
+        self.up3 = Up(256, 128 // factor, bilinear)
+        self.up4 = Up(128, 64, bilinear)
+        self.outc = OutConv(64, n_classes)
+
+    def forward(self, x):
+        if x.dim() == 2:
+            x = x.unsqueeze(1)
+        x1 = self.inc(x)
+        x2 = self.down1(x1)
+        x3 = self.down2(x2)
+        x4 = self.down3(x3)
+        x5 = self.down4(x4)
+        x = self.up1(x5, x4)
+        x = self.up2(x, x3)
+        x = self.up3(x, x2)
+        x = self.up4(x, x1)
+        return self.outc(x).squeeze(1)
+
+
+# ===================== 3. 训练与推理 =====================
+def correlation_loss(y_pred, y_true):
+    vx = y_pred - torch.mean(y_pred)
+    vy = y_true - torch.mean(y_true)
+    corr = torch.sum(vx * vy) / (torch.sqrt(torch.sum(vx ** 2)) * torch.sqrt(torch.sum(vy ** 2)) + 1e-8)
+    return 1 - corr  # 越小越好
+
+
+def spectral_loss(y_pred, y_true):
+    pred_fft = torch.fft.rfft(y_pred, dim=-1)
+    true_fft = torch.fft.rfft(y_true, dim=-1)
+    return torch.mean(torch.abs(torch.abs(pred_fft) - torch.abs(true_fft)))
+
+
+# 训练时适配新的输出格式
+# for batch in train_loader: x, y, x_mean, x_std = batch
+# 推理时同样适配
+
+def train_model(model, train_loader, device, epochs=50, lr=1e-4):
+    model.to(device)
+    optimizer = optim.Adam(model.parameters(), lr=lr)
+    mse_loss = nn.MSELoss()
+    model.train()
+    for epoch in range(epochs):
+        total_loss = 0
+        for batch in train_loader:
+            x, y, _, _ = batch
+            x, y = x.to(device), y.to(device)
+            optimizer.zero_grad()
+            out = model(x)
+            loss = mse_loss(out, y) + 0.2 * correlation_loss(out, y) + 0.3 * spectral_loss(out, y)
+            loss.backward()
+            optimizer.step()
+            total_loss += loss.item()
+        print(f"Epoch {epoch + 1}/{epochs}, Loss: {total_loss / len(train_loader):.6f}")
+    return model
+
+
+def predict(model, atten_signals, device, segment_length=1024):
+    model.eval()
+    results = []
+    with torch.no_grad():
+        for i in range(len(atten_signals)):
+            x = np.array(atten_signals[i]).astype(np.float32)
+            if len(x) > segment_length:
+                x = x[:segment_length]
+            else:
+                x = np.pad(x, (0, segment_length - len(x)), 'edge')
+                x_mean, x_std = np.mean(x), np.std(x) + 1e-8
+                x_norm = (x - x_mean) / x_std
+                x_tensor = torch.from_numpy(x_norm).unsqueeze(0).to(device)
+                out = model(x_tensor)
+                out_np = out.cpu().numpy().flatten()
+                results.append(out_np)
+    return results
+
+
+# ===================== 4. 数据加载（你的方式） =====================
+def load_training_data():
+    print("\n加载预生成的Chirp训练数据...");
+    try:
+        all_beddot_signals = np.load(r'D:\UGA\heartbeat_system\data\chirp_output_samples.npy', allow_pickle=True)
+        all_bcg_signals = np.load(r'D:\UGA\heartbeat_system\data\chirp_input_samples.npy', allow_pickle=True)
+        print(f"成功加载Chirp训练数据: 输入 {len(all_beddot_signals)}, 目标 {len(all_bcg_signals)}");
+        return list(all_beddot_signals), list(all_bcg_signals)
+    except FileNotFoundError:
+        print("错误: 预生成的训练数据文件未找到！请检查路径。");
+        return None, None
+
+
+def load_testing_data():
+    print("\n加载独立的测试数据...");
+    try:
+        ground_truth_signal = np.load(r'D:\UGA\heartbeat_system\data\ABP_extracted_first6000.npy', allow_pickle=True)
+        beddot_to_predict = np.load(r'D:\UGA\heartbeat_system\data\beddot_signals.npy', allow_pickle=True)
+        print(
+            f"成功加载测试数据: ABP (Ground Truth) {len(ground_truth_signal)}, BedDot (用于预测) {len(beddot_to_predict)}");
+        return list(ground_truth_signal), list(beddot_to_predict)
+    except FileNotFoundError:
+        print("错误: 测试数据文件未找到！请检查路径。");
+        return None, None
+
+
+def evaluate_metrics(true_signals, pred_signals):
+    maes, mses, cors = [], [], []
+    for t, p in zip(true_signals, pred_signals):
+        t, p = np.array(t).flatten(), np.array(p).flatten()
+        min_len = min(len(t), len(p))
+        t, p = t[:min_len], p[:min_len]
+        maes.append(np.mean(np.abs(t - p)))
+        mses.append(np.mean((t - p) ** 2))
+        if np.std(t) > 1e-6 and np.std(p) > 1e-6:
+            cors.append(np.corrcoef(t, p)[0, 1])
+    print(f"MAE: {np.mean(maes):.4f}")
+    print(f"MSE: {np.mean(mses):.4f}")
+    print(f"相关系数: {np.mean(cors):.4f}")
+
+
+def plot_signals(raw, atten, recon, idx=0, fs=100):
+    import matplotlib
+    matplotlib.rcParams['font.sans-serif'] = ['SimHei']  # 显示中文
+    matplotlib.rcParams['axes.unicode_minus'] = False  # 正常显示负号
+    min_len = min(len(raw[idx]), len(atten[idx]), len(recon[idx]))
+    t = np.arange(min_len) / fs
+    plt.figure(figsize=(15, 10))
+
+    plt.subplot(3, 1, 1)
+    plt.plot(t, raw[idx][:min_len], color='b', label='原始信号', linewidth=2)
+    plt.ylabel('幅度')
+    plt.title(f'第{idx}个样本-原始信号')
+    plt.legend()
+    plt.grid(True)
+
+    plt.subplot(3, 1, 2)
+    plt.plot(t, atten[idx][:min_len], color='g', label='衰减信号', linewidth=2)
+    plt.ylabel('幅度')
+    plt.title(f'第{idx}个样本-衰减信号')
+    plt.legend()
+    plt.grid(True)
+
+    plt.subplot(3, 1, 3)
+    plt.plot(t, recon[idx][:min_len], color='r', label='重建信号', linewidth=2)
+    plt.xlabel('时间 (秒)')
+    plt.ylabel('幅度')
+    plt.title(f'第{idx}个样本-重建信号')
+    plt.legend()
+    plt.grid(True)
+
+    plt.tight_layout()
+    plt.show()
+
+
+def calculate_scalar_performance_metrics(true_signal, pred_signal):
+    metrics = {'MAE': np.nan, 'RMSE': np.nan, 'Correlation': np.nan, 'SMAPE': np.nan}
+    true, pred = np.array(true_signal).flatten(), np.array(pred_signal).flatten()
+    min_len = min(len(true), len(pred))
+    if min_len < 2: return metrics
+    true, pred = true[:min_len], pred[:min_len]
+    metrics['MAE'] = np.mean(np.abs(true - pred))
+    metrics['RMSE'] = np.sqrt(np.mean((true - pred) ** 2))
+    epsilon = 1e-9
+    metrics['SMAPE'] = np.mean(np.abs(pred - true) / ((np.abs(true) + np.abs(pred)) / 2 + epsilon)) * 100
+    if min_len > 1 and np.var(true) > epsilon and np.var(pred) > epsilon:
+        metrics['Correlation'] = np.corrcoef(true, pred)[0, 1]
+    return metrics
+
+
+def trend_similarity(orig_seg, rec_seg):
+    min_len = min(len(orig_seg), len(rec_seg))
+    if min_len < 2: return 0.0
+    t = np.arange(min_len)
+    epsilon_std = 1e-9
+    if np.std(orig_seg[:min_len]) < epsilon_std:
+        slope_orig = 0.0
+    else:
+        slope_orig, _ = np.polyfit(t, orig_seg[:min_len], 1)
+    mean_orig = np.mean(orig_seg[:min_len])
+    mean_rec = np.mean(rec_seg[:min_len])
+    rec_aligned = rec_seg[:min_len] - (mean_rec - mean_orig)
+    if np.std(rec_aligned) < epsilon_std:
+        slope_rec_aligned = 0.0
+    else:
+        slope_rec_aligned, _ = np.polyfit(t, rec_aligned, 1)
+    angle_orig = np.arctan(slope_orig)
+    angle_rec = np.arctan(slope_rec_aligned)
+    angle_diff = np.abs(angle_orig - angle_rec)
+    range_orig = np.max(orig_seg[:min_len]) - np.min(orig_seg[:min_len])
+    range_rec_aligned = np.max(rec_aligned) - np.min(rec_aligned)
+    max_signal_range = max(range_orig, range_rec_aligned)
+    max_angle_epsilon = 1e-9
+    if min_len > 1 and max_signal_range > max_angle_epsilon:
+        max_slope_val = max_signal_range / (min_len - 1)
+        max_angle = np.arctan(max_slope_val)
+    else:
+        max_angle = np.pi / 2
+    if max_angle < max_angle_epsilon:
+        ts = 1.0
+    elif slope_orig * slope_rec_aligned >= 0:
+        ts = 1 - (angle_diff / max_angle)
+    else:
+        ts = - (angle_diff / max_angle)
+    return ts
+
+
+def calculate_all_similarity_metrics(original, reconstructed):
+    metrics = {}
+    traditional_metrics = calculate_scalar_performance_metrics(original, reconstructed)
+    metrics.update(traditional_metrics)
+    metrics['TS'] = trend_similarity(original, reconstructed)
+    return metrics
+
+
+def calculate_overall_metrics(original_signals, reconstructed_signals):
+    all_metrics = []
+    for true_s, pred_s in zip(original_signals, reconstructed_signals):
+        min_len = min(len(true_s), len(pred_s))
+        if min_len < 2:
+            continue
+        signal_metrics = calculate_all_similarity_metrics(true_s, pred_s)
+        all_metrics.append(signal_metrics)
+    if not all_metrics:
+        return {
+            'MAE': np.nan, 'RMSE': np.nan, 'Correlation': np.nan, 'SMAPE': np.nan, 'TS': np.nan
+        }
+    overall_metrics = {}
+    for key in all_metrics[0].keys():
+        values = [m[key] for m in all_metrics if not np.isnan(m[key])]
+        overall_metrics[key] = np.mean(values) if values else np.nan
+    return overall_metrics
+
+
+def print_evaluation_metrics(title, metrics):
+    print(f"\n--- {title} ---")
+    print("  传统指标:")
+    print(f"    MAE: {metrics.get('MAE', float('nan')):.4f}")
+    print(f"    RMSE: {metrics.get('RMSE', float('nan')):.4f}")
+    print(f"    相关系数: {metrics.get('Correlation', float('nan')):.4f}")
+    print(f"    SMAPE: {metrics.get('SMAPE', float('nan')):.4f}%")
+    print(f"    Trend Similarity(TS): {metrics.get('TS', float('nan')):.4f}")
+
+
+def mean_peak2peak(signal):
+    """计算信号每周期的平均波峰-波谷幅值"""
+    signal = np.array(signal).flatten()
+    peaks, _ = find_peaks(signal)
+    troughs, _ = find_peaks(-signal)
+    extrema = np.sort(np.concatenate([peaks, troughs]))
+    if len(extrema) < 2:
+        return np.nan
+    diffs = np.abs(signal[extrema[1:]] - signal[extrema[:-1]])
+    return np.mean(diffs) if len(diffs) > 0 else np.nan
+
+
+def evaluate_peak2peak(true_signals, pred_signals):
+    """对所有样本计算平均波峰-波谷幅值及误差"""
+    true_p2p = [mean_peak2peak(s) for s in true_signals]
+    pred_p2p = [mean_peak2peak(s) for s in pred_signals]
+    valid = [(t, p) for t, p in zip(true_p2p, pred_p2p) if not np.isnan(t) and not np.isnan(p)]
+    if not valid:
+        return {'True_P2P': np.nan, 'Pred_P2P': np.nan, 'AbsError': np.nan, 'RelError(%)': np.nan}
+    t_arr, p_arr = np.array([v[0] for v in valid]), np.array([v[1] for v in valid])
+    abs_err = np.mean(np.abs(t_arr - p_arr))
+    rel_err = np.mean(np.abs(t_arr - p_arr) / (t_arr + 1e-8)) * 100
+    return {
+        'True_P2P': np.mean(t_arr),
+        'Pred_P2P': np.mean(p_arr),
+        'AbsError': abs_err,
+        'RelError(%)': rel_err
+    }
+
+
+def main_wave_amplitudes_strict(signal, fs=100, min_cycle_sec=0.6, prominence=0.5, min_amp=50):
+    """
+    更严格的主波幅度识别：只统计“谷-峰”对，且幅度小于min_amp的不计入
+    """
+    signal = np.array(signal).flatten()
+    min_distance = int(fs * min_cycle_sec)
+    peaks, _ = find_peaks(signal, distance=min_distance, prominence=prominence)
+    troughs, _ = find_peaks(-signal, distance=min_distance, prominence=prominence)
+    extrema = np.concatenate([peaks, troughs])
+    extrema.sort()
+    amps = []
+    peak_idx = []
+    trough_idx = []
+    i = 0
+    while i < len(extrema) - 1:
+        if extrema[i] in troughs and extrema[i+1] in peaks:
+            tr = extrema[i]
+            pk = extrema[i+1]
+            amp = signal[pk] - signal[tr]
+            if amp >= min_amp:
+                amps.append(amp)
+                peak_idx.append(pk)
+                trough_idx.append(tr)
+            i += 2
+        else:
+            i += 1
+    return amps, peak_idx, trough_idx
+
+
+def evaluate_main_wave_amplitude(true_signals, pred_signals, fs=100, min_cycle_sec=0.6, prominence=0.5, min_amp=50):
+    """
+    评估每个样本所有周期主波幅度的均值和中位数，并统计误差（严格谷-峰配对，幅度小于min_amp不计入）
+    新增：MAPE（平均绝对百分比误差）
+    """
+    true_amps = [main_wave_amplitudes_strict(s, fs, min_cycle_sec, prominence, min_amp)[0] for s in true_signals]
+    pred_amps = [main_wave_amplitudes_strict(s, fs, min_cycle_sec, prominence, min_amp)[0] for s in pred_signals]
+    valid = [(np.mean(t), np.mean(p), np.median(t), np.median(p), t, p) for t, p in zip(true_amps, pred_amps) if len(t) > 0 and len(p) > 0]
+    if not valid:
+        return {'True_Mean': np.nan, 'Pred_Mean': np.nan, 'AbsError_Mean': np.nan, 'RelError_Mean(%)': np.nan,
+                'True_Median': np.nan, 'Pred_Median': np.nan, 'AbsError_Median': np.nan, 'RelError_Median(%)': np.nan,
+                'MAPE': np.nan}
+    t_mean, p_mean, t_median, p_median, t_list, p_list = zip(*valid)
+    abs_err_mean = np.mean(np.abs(np.array(t_mean) - np.array(p_mean)))
+    rel_err_mean = np.mean(np.abs(np.array(t_mean) - np.array(p_mean)) / (np.array(t_mean) + 1e-8)) * 100
+    abs_err_median = np.mean(np.abs(np.array(t_median) - np.array(p_median)))
+    rel_err_median = np.mean(np.abs(np.array(t_median) - np.array(p_median)) / (np.array(t_median) + 1e-8)) * 100
+    # 计算MAPE（所有周期主波幅度的MAPE，逐元素）
+    mape_list = []
+    for t, p in zip(t_list, p_list):
+        min_len = min(len(t), len(p))
+        if min_len == 0:
+            continue
+        t_arr = np.array(t[:min_len])
+        p_arr = np.array(p[:min_len])
+        mape = np.mean(np.abs(p_arr - t_arr) / (np.abs(t_arr) + 1e-8)) * 100
+        mape_list.append(mape)
+    mape_val = np.mean(mape_list) if mape_list else np.nan
+    return {
+        'True_Mean': np.mean(t_mean),
+        'Pred_Mean': np.mean(p_mean),
+        'AbsError_Mean': abs_err_mean,
+        'RelError_Mean(%)': rel_err_mean,
+        'True_Median': np.mean(t_median),
+        'Pred_Median': np.mean(p_median),
+        'AbsError_Median': abs_err_median,
+        'RelError_Median(%)': rel_err_median,
+        'MAPE': mape_val
+    }
+
+
+def plot_main_wave(signal, fs=100, min_cycle_sec=0.6, prominence=0.5, min_amp=50, title="主波检测"):
+    """画出信号及检测到的主波峰谷（严格谷-峰配对，幅度小于min_amp不画），便于人工核查"""
+    import matplotlib.pyplot as plt
+    signal = np.array(signal).flatten()
+    amps, peaks, troughs = main_wave_amplitudes_strict(signal, fs, min_cycle_sec, prominence, min_amp)
+    t = np.arange(len(signal)) / fs
+    plt.figure(figsize=(12, 4))
+    plt.plot(t, signal, label='信号')
+    plt.scatter(t[peaks], signal[peaks], color='r', marker='^', label='主波峰')
+    plt.scatter(t[troughs], signal[troughs], color='g', marker='v', label='主波谷')
+    for pk, tr in zip(peaks, troughs):
+        plt.plot([t[tr], t[pk]], [signal[tr], signal[pk]], 'k--', alpha=0.5)
+    plt.xlabel('时间 (秒)')
+    plt.ylabel('幅度')
+    plt.title(title)
+    plt.legend()
+    plt.grid(True)
+    plt.tight_layout()
+    plt.show()
+
+
+# ===================== 5. 主流程 =====================
+if __name__ == "__main__":
+    # 1. 加载数据
+    train_x, train_y = load_training_data()
+    test_y, test_x = load_testing_data()  # 注意：推理时只用test_x，test_y仅用于评估
+
+    if train_x is None or test_x is None:
+        print("数据加载失败，程序终止。")
+        exit(1)
+
+    # 2. 构建数据集（训练集带幅度扩展，测试集不扩展）
+    train_dataset = SignalDataset(train_x, train_y, segment_length=1024, is_train=True, scale_range=(1, 300))
+    train_loader = DataLoader(train_dataset, batch_size=16, shuffle=True)
+
+    # 3. 初始化模型
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model = UNet1D(n_channels=1, n_classes=1, bilinear=True)
+
+    # 4. 训练
+    model = train_model(model, train_loader, device, epochs=150, lr=1e-4)
+
+    # 5. 推理（只用衰减信号，归一化方式与训练一致）
+    pred_test = predict(model, test_x, device, segment_length=1024)
+
+    # 6. 保存结果
+    np.save("reconstructed_test.npy", np.array(pred_test))
+    print("测试集重建完成，结果已保存。")
+
+    # 7. 自动评估与可视化
+    print("\n===== 重建效果评估 =====")
+    evaluate_metrics(test_y, pred_test)
+    print("\n===== 自动绘制前3个样本对比图 =====")
+    n_plot = min(3, len(test_y), len(test_x), len(pred_test))
+    for idx in range(n_plot):
+        plot_signals(test_y, test_x, pred_test, idx=idx, fs=100)
+
+    # 在主流程最后加入评估指标打印
+    overall_metrics = calculate_overall_metrics(test_y, pred_test)
+    print_evaluation_metrics("测试集重建信号评估指标", overall_metrics)
+
+    # 新增：波峰-波谷幅值评估
+    p2p_metrics = evaluate_peak2peak(test_y, pred_test)
+    print("\n--- 波峰-波谷幅值评估 ---")
+    print(f"  真实信号平均P2P: {p2p_metrics['True_P2P']:.4f}")
+    print(f"  重建信号平均P2P: {p2p_metrics['Pred_P2P']:.4f}")
+    print(f"  绝对误差: {p2p_metrics['AbsError']:.4f}")
+    print(f"  相对误差: {p2p_metrics['RelError(%)']:.2f}%")
+
+    # 新增：每个样本所有周期主波幅度均值/中位数评估
+    mainwave_metrics = evaluate_main_wave_amplitude(test_y, pred_test, min_amp=50)
+    print("\n--- 所有周期主波幅度评估 ---")
+    print(f"  真实信号主波幅度均值: {mainwave_metrics['True_Mean']:.4f}")
+    print(f"  重建信号主波幅度均值: {mainwave_metrics['Pred_Mean']:.4f}")
+    print(f"  均值绝对误差: {mainwave_metrics['AbsError_Mean']:.4f}")
+    print(f"  均值相对误差: {mainwave_metrics['RelError_Mean(%)']:.2f}%")
+    print(f"  真实信号主波幅度中位数: {mainwave_metrics['True_Median']:.4f}")
+    print(f"  重建信号主波幅度中位数: {mainwave_metrics['Pred_Median']:.4f}")
+    print(f"  中位数绝对误差: {mainwave_metrics['AbsError_Median']:.4f}")
+    print(f"  中位数相对误差: {mainwave_metrics['RelError_Median(%)']:.2f}%")
+    print(f"  主波幅度MAPE: {mainwave_metrics['MAPE']:.2f}%")
+
+    # 示例：人工核查前3个样本主波检测效果
+    print("\n===== 主波峰谷检测可视化（前3个样本） =====")
+    if test_y is not None and test_x is not None and pred_test is not None:
+        n_plot = min(3, len(test_y), len(test_x), len(pred_test))
+        for idx in range(n_plot):
+            print(f"样本{idx} - 真实信号主波检测：")
+            plot_main_wave(test_y[idx], fs=100, min_cycle_sec=0.6, prominence=0.5, min_amp=50, title=f"真实信号-样本{idx}")
+            print(f"样本{idx} - 重建信号主波检测：")
+            plot_main_wave(pred_test[idx], fs=100, min_cycle_sec=0.6, prominence=0.5, min_amp=50, title=f"重建信号-样本{idx}")
