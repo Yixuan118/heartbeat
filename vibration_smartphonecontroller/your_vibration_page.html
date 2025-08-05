@@ -1,0 +1,77 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>JS Bridge 精确阶梯振动</title>
+    <style>
+        body { font-family: sans-serif; text-align: center; padding: 20px; line-height: 1.6; }
+        .param-group { margin-bottom: 20px; }
+        label { display: inline-block; width: 200px; text-align: right; margin-right: 10px; }
+        input { width: 100px; padding: 5px; }
+        button { padding: 12px 25px; margin: 10px; font-size: 1.3em; cursor: pointer; }
+        #log { margin-top: 20px; padding: 10px; background: #eee; border-radius: 5px; min-height: 50px; display: flex; align-items: center; justify-content: center; }
+    </style>
+</head>
+<body>
+<h1>清晰脉冲阶梯振动</h1>
+
+<div class="param-group">
+    <label for="startFreq">起始频率 (Hz):</label>
+    <input type="number" id="startFreq" value="0.5" step="0.1">
+</div>
+
+<div class="param-group">
+    <label for="endFreq">结束频率 (Hz):</label>
+    <input type="number" id="endFreq" value="5.0" step="0.1">
+</div>
+
+<div class="param-group">
+    <label for="freqStep">频率步进 (Hz):</label>
+    <input type="number" id="freqStep" value="0.5" step="0.1">
+</div>
+
+<div class="param-group">
+    <label for="stepDuration">每阶段持续时间 (秒):</label>
+    <input type="number" id="stepDuration" value="10">
+</div>
+
+<button onclick="startVibration()">开始清晰脉冲</button>
+<button onclick="stopVibration()">停止振动</button>
+
+<div id="log">等待操作...</div>
+
+<script>
+    // 这个函数现在只由原生代码调用，用于更新UI
+    function updateStatus(message) {
+      document.getElementById('log').textContent = message;
+    }
+
+    function startVibration() {
+      const startFreq = parseFloat(document.getElementById('startFreq').value);
+      const endFreq = parseFloat(document.getElementById('endFreq').value);
+      const freqStep = parseFloat(document.getElementById('freqStep').value);
+      const stepDurationMs = parseInt(document.getElementById('stepDuration').value) * 1000;
+
+      // 检查正确的函数名: startVibrationSequence
+      if (typeof AndroidVibrator !== 'undefined' && AndroidVibrator.startVibrationSequence) {
+        updateStatus('请求启动振动序列...'); // 直接调用状态更新函数
+        // 调用正确的原生函数
+        AndroidVibrator.startVibrationSequence(startFreq, endFreq, freqStep, stepDurationMs);
+      } else {
+        updateStatus("错误: 原生振动接口不可用。");
+      }
+    }
+
+    function stopVibration() {
+      // 检查正确的函数名: stopVibration
+      if (typeof AndroidVibrator !== 'undefined' && AndroidVibrator.stopVibration) {
+        // 不需要在这里更新UI，因为原生代码的stopVibration会回调updateStatus
+        AndroidVibrator.stopVibration(true);
+      } else {
+        updateStatus("错误: 原生停止接口不可用。");
+      }
+    }
+</script>
+</body>
+</html>
