@@ -18,7 +18,7 @@ MAX_ATTEMPTS = 10  # 最大尝试次数
 # 安全警告：强烈建议使用环境变量
 API_KEY = os.getenv("GEMINI_API_KEY")
 if not API_KEY:
-    API_KEY = "(YOUR_API_KEY)"
+    API_KEY = "YOUR_API_KEY"
     print("警告: 正在使用硬编码的API密钥，存在安全风险。", file=sys.stderr)
 
 PROXY_URL = "http://127.0.0.1:7897"
@@ -147,6 +147,8 @@ def save_and_run_code(code, filename):
             print(f"警告: 程序运行产生错误/警告! 日志: {os.path.abspath(stderr_path)}")
         else:
             print(f"成功: 程序运行完毕。输出: {os.path.abspath(stdout_path)}")
+
+        # 返回标准输出、标准错误和布尔型的运行成功标志
         return result.stdout, result.stderr, not bool(result.stderr.strip())
 
     except subprocess.TimeoutExpired:
@@ -157,6 +159,40 @@ def save_and_run_code(code, filename):
         err = f"错误: 运行程序时发生意外错误: {e}"
         print(err, file=sys.stderr)
         return "", err, False
+
+
+def evaluate_output(stdout_text, goals):
+    """
+    解析生成脚本的stdout，检查是否满足数值目标。
+    """
+    # 这是一个简化的实现，只检查了相关系数的目标。
+    # 更复杂的实现可以解析prompt中的所有目标。
+    goal_correlation = 0.75
+
+    # 尝试在输出中找到训练集相关系数
+    match = re.search(r"Train.*?Correlation.*?:?\s*(-?[\d\.]+)", stdout_text, re.IGNORECASE)
+
+    if not match:
+        msg = "未能于程序输出中找到'Train Correlation'的值。"
+        print(f"评估警告: {msg}")
+        return False, msg
+
+    try:
+        actual_correlation = float(match.group(1))
+        print(f"评估检查: 从输出中提取的训练集相关系数为 {actual_correlation:.4f}")
+
+        if actual_correlation >= goal_correlation:
+            msg = f"数值目标达成: 相关系数 {actual_correlation:.4f} >= {goal_correlation}"
+            print(f"评估成功: {msg}")
+            return True, msg
+        else:
+            msg = f"数值目标未达成: 相关系数为 {actual_correlation:.4f}，但目标是 >= {goal_correlation}"
+            print(f"评估失败: {msg}")
+            return False, msg
+    except (ValueError, IndexError):
+        msg = "找到'Train Correlation'但无法解析其数值。"
+        print(f"评估警告: {msg}")
+        return False, msg
 
 
 # --- 主函数 ---
@@ -174,9 +210,8 @@ def main():
     prompt_data = parse_prompt_file(PROMPT_FILE_PATH)
 
     # 初始化迭代上下文
-    history = []
     last_code = ""
-    last_error = ""
+    last_feedback = ""
 
     for attempt in range(1, MAX_ATTEMPTS + 1):
         print("\n" + "-" * 25 + f" 第 {attempt} 次尝试 " + "-" * 25)
@@ -189,7 +224,7 @@ def main():
                 "\n--- REQUIREMENTS ---\n" + "\n".join(prompt_data['requirements']),
                 "\n--- GOALS ---\n" + "\n".join(prompt_data['goals']),
                 "\n--- TIPS ---\n" + "\n".join(prompt_data['tips']),
-                "\n--- OUTPUT FORMAT ---\n...",
+                "\n--- OUTPUT FORMAT ---\nFollow this format strictly:",
                 "```python\n# [Your Python code here]\n```",
                 "\n## 评估摘要:\n# [Your analysis...]",
                 "\n## 最终结论: YES/NO"
@@ -197,13 +232,12 @@ def main():
         else:
             # 后续尝试，加入反馈信息
             prompt_parts = [
-                "You are an expert Python developer tasked with fixing a script that failed to meet its goals. Analyze the previous attempt's code and error/output, then provide a new, improved version.",
+                "You are an expert Python developer tasked with fixing a script that failed to meet its goals. Analyze the previous attempt's code and the feedback from its execution, then provide a new, improved version.",
                 "\n--- ORIGINAL GOALS ---\n" + "\n".join(prompt_data['goals']),
                 "\n--- PREVIOUS CODE (ATTEMPT " + str(attempt - 1) + ") ---\n```python\n" + last_code + "\n```",
-                "\n--- PREVIOUS RUNTIME ERROR/OUTPUT ---\n" + (
-                    last_error if last_error else "No runtime errors, but goals were not met according to self-assessment."),
+                "\n--- FEEDBACK FROM PREVIOUS ATTEMPT ---\n" + last_feedback,
                 "\n--- INSTRUCTION ---",
-                "Please provide a new, complete Python script that fixes the issues and is more likely to meet the goals. Follow the original output format.",
+                "Please provide a new, complete Python script that fixes the issues and is more likely to meet the goals. Focus on improving the signal processing algorithm to meet the numerical targets. Follow the original output format.",
                 "\n--- NEW OUTPUT ---",
                 "```python\n# [Your new and improved Python code here]\n```",
                 "\n## 评估摘要:\n# [Explain what you changed and why the new code is better...]",
@@ -227,22 +261,32 @@ def main():
         stdout, stderr, run_success = save_and_run_code(generated_code, filename)
 
         # 4. 检查成功条件
-        if conclusion == "YES" and run_success:
+        numerical_goals_met = False
+        if run_success:
+            # 如果代码运行无误，则检查数值输出
+            numerical_goals_met, last_feedback = evaluate_output(stdout, prompt_data['goals'])
+        else:
+            # 如果代码运行失败，则使用stderr作为反馈
+            last_feedback = stderr
+
+        if numerical_goals_met:
             print("\n" + "=" * 60)
-            print("✅ 成功！模型评估为'YES'且代码运行无误。")
+            print("✅ 成功！代码运行无误且数值目标达成。")
             print(f"最终代码保存在: {os.path.abspath(filename)}")
+            print(f"评估详情: {last_feedback}")
             print("=" * 60)
             return  # 成功退出
 
         # 5. 准备下一次迭代
+        print("❌ 本次尝试失败，准备下一次迭代...")
         last_code = generated_code
-        last_error = stderr
+        # last_feedback 已经在上面被赋值
 
     # 如果循环结束仍未成功
     print("\n" + "=" * 60)
     print(f"❌ 失败: 经过 {MAX_ATTEMPTS} 次尝试后，仍未达成目标。")
     print("请检查最后一次尝试生成的代码和日志。")
-    print(f"最后一次尝试的代码: {os.path.abspath(PROGRAM_A_FILENAME_TEMPLATE.format(MAX_ATTEMPTS))}")
+    print(f"最后一次尝试的代码: {os.path.abspath(PROGRAM_A_FILENAME_TEMPLATE.format(attempt))}")
     print("=" * 60)
 
 
@@ -253,3 +297,4 @@ if __name__ == "__main__":
         print("\n程序被用户中断。")
     except Exception as e:
         print(f"\n程序因未捕获的异常而终止: {e}")
+
