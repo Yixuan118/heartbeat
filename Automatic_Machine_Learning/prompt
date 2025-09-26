@@ -1,0 +1,45 @@
+# requirements
+1. Write a python code to find the best model of signal processing techniques to study bed transfer function of vibration signals.
+
+2. Data files are located in a subfolder named 'data'. The paths are:
+train_on_bed_file = r"data/raw_signal_before_2025-09-12T212843_2025-09-12T215206.npy"
+train_under_bed_file = r"data/raw_signal_after_2025-09-12T212843_2025-09-12T215206.npy"
+test_on_bed_file = r"data/raw_signal_before_2025-09-15T155034_2025-09-15T161548.npy"
+test_under_bed_file = r"data/raw_signal_after_2025-09-15T155034_2025-09-15T161548.npy"
+The input data is an NPY file with M rows and 10 columns. Each row contains vibration data (10 seconds samples at 100Hz).
+
+3. The input data is time-series sensor data, please use advanced signal processing techniques. Do not use deep learning.
+
+4. The first and last samples of each data file may have significant noise and can be directly deleted.
+
+5. There may be a time misalignment problem within one second between the data files. Handling this is important.
+
+6. The training and test set data are chirp waves with continuously increasing amplitude and frequency (0.5Hz to 3.5Hz). The attenuation of high-frequency signals is more significant.
+
+7. Reconstruct the signal using the derived transfer function.
+
+8. Output the MAE (mean absolute error), MSE (mean squared error), ME (mean error), and STD (standard deviation) for the train and test sets respectively.
+
+9. CRITICAL OUTPUT FORMAT: The script MUST print the final correlation results to standard output. The output format MUST strictly follow these exact patterns on separate lines, with nothing else on those lines:
+Train Correlation: [numeric_value]
+Test Correlation: [numeric_value]
+This is mandatory for automated evaluation.
+
+10. Take your time to think longer and deeper about the signal processing steps.
+
+11. Preprocessing: Before any other processing, consider applying a band-pass filter to the signals to isolate the main frequency range of interest (e.g., 0.5Hz to 4.0Hz). This can remove significant noise. Also, consider averaging the 10 columns of data for each row to create a single, more robust time-series signal.
+
+# goals
+1. The correlation coefficient on the training set should be at least greater than 0.75.
+
+2. The correlation coefficient on the test set should also be at least greater than 0.75.
+
+# tips
+1. You may find these papers useful for analysis and methods:
+https://iopscience.iop.org/article/10.1088/1742-6596/2523/1/012022/meta
+https://www.sciencedirect.com/science/article/abs/pii/S2352710225019618
+https://ieeexplore.ieee.org/abstract/document/10807215
+https://link.springer.com/article/10.1007/s00034-022-02113-4
+https://ieeexplore.ieee.org/abstract/document/10852350
+
+2. It is highly recommended to use Welch's method (scipy.signal.welch) to get a more stable and less noisy estimate of the power spectral density (PSD) for both signals. The transfer function can then be estimated from the cross-spectral density and the input signal's PSD. This is generally more robust for real-world, noisy data.
