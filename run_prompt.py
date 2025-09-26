@@ -1,4 +1,3 @@
-
 import os
 import sys
 import subprocess
@@ -166,8 +165,6 @@ def evaluate_output(stdout_text, goals):
     """
     解析生成脚本的stdout，检查是否满足数值目标。
     """
-    # 这是一个简化的实现，只检查了相关系数的目标。
-    # 更复杂的实现可以解析prompt中的所有目标。
     goal_correlation = 0.75
 
     # 尝试在输出中找到训练集相关系数
@@ -298,5 +295,6 @@ if __name__ == "__main__":
         print("\n程序被用户中断。")
     except Exception as e:
         print(f"\n程序因未捕获的异常而终止: {e}")
+
 
 
