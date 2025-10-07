@@ -13,10 +13,10 @@ SAMPLES_PER_SEGMENT = int(SAMPLING_RATE * SEGMENT_LENGTH_SEC)
 CHANNEL_TO_ANALYZE = 0
 
 # --- File Paths ---
-TRAIN_ON_BED_FILE = r"D:\UGA\CoreDemo-master\CoreDemo-master\influxexample\raw_signal_before_2025-10-04T161532_2025-10-04T162821.npy"
-TRAIN_UNDER_BED_FILE = r"D:\UGA\CoreDemo-master\CoreDemo-master\influxexample\raw_signal_after_2025-10-04T161532_2025-10-04T162821.npy"
-TEST_ON_BED_FILE = r"D:\UGA\CoreDemo-master\CoreDemo-master\influxexample\raw_signal_before_2025-09-15T233703_2025-09-15T234233.npy"
-TEST_UNDER_BED_FILE = r"D:\UGA\CoreDemo-master\CoreDemo-master\influxexample\raw_signal_after_2025-09-15T233703_2025-09-15T234233.npy"
+TRAIN_ON_BED_FILE = r"./data/raw_signal_before_2025-10-04T161532_2025-10-04T162821.npy"
+TRAIN_UNDER_BED_FILE = r"./data/raw_signal_after_2025-10-04T161532_2025-10-04T162821.npy"
+TEST_ON_BED_FILE = r"./data/raw_signal_before_2025-09-15T233703_2025-09-15T234233.npy"
+TEST_UNDER_BED_FILE = r"./data/raw_signal_after_2025-09-15T233703_2025-09-15T234233.npy"
 
 # --- Bandpass Filter Parameters ---
 LOWCUT_FREQ = 5  # Hz
@@ -314,3 +314,4 @@ if __name__ == "__main__":
         plt.legend()
         plt.tight_layout()
         plt.show()
+
