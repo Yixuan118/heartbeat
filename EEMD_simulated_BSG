@@ -1,0 +1,235 @@
+import numpy as np
+from scipy import signal
+from scipy.fft import fft, ifft
+from scipy.stats import pearsonr
+import matplotlib.pyplot as plt
+from PyEMD import EEMD
+
+# --- Matplotlib Chinese Font Configuration ---
+try:
+    plt.rcParams['font.sans-serif'] = ['SimHei', 'Microsoft YaHei', 'FangSong', 'Arial Unicode MS']
+    plt.rcParams['axes.unicode_minus'] = False
+except Exception:
+    print("Warning: Failed to set Chinese fonts. Default fonts will be used.")
+
+# =============================================================================
+# 1. Configuration
+# =============================================================================
+fs = 100  # Sampling frequency (Hz)
+lowcut_freq = 4.5  # Low cutoff frequency for bandpass filter (Hz)
+highcut_freq = 9.5  # High cutoff frequency for bandpass filter (Hz)
+filter_order = 5  # Order of the bandpass filter
+FFT_DENOISE_THRESHOLD_RATIO = 0.35  # Threshold ratio for FFT denoising
+TEST_SEGMENT_NUM = 20  # Number of segments to extract for testing (to save computation time)
+NOISE_AMOUNT = 0.05  # Noise intensity (Gaussian white noise)
+
+# Path to the real heartbeat signal test set file
+new_test_set_file = r"./data/BSG_train_rr_noise.npy"
+
+
+# =============================================================================
+# 2. Helper Functions
+# =============================================================================
+def fft_denoise(signal, threshold_ratio):
+    """
+    FFT-based frequency domain denoising: retain frequency components with amplitude above the threshold.
+    Args:
+        signal: 1D numpy array, time-domain signal to be denoised
+        threshold_ratio: float (0~1), ratio of the threshold to the maximum spectrum amplitude
+    Returns:
+        denoised_signal: 1D numpy array, denoised time-domain signal
+    """
+    fft_result = fft(signal)
+    spectrum = np.abs(fft_result)
+    threshold = threshold_ratio * np.max(spectrum)
+    fft_result[spectrum < threshold] = 0
+    denoised_signal = np.real(ifft(fft_result))
+    return denoised_signal
+
+
+def apply_eemd_pipeline(segments, fft_threshold_ratio):
+    """
+    Complete EEMD denoising pipeline:
+    Signal Centering → EEMD Decomposition → Remove 1st IMF (high-frequency noise) → FFT Denoising
+    Args:
+        segments: List of numpy arrays, signal segments to be processed
+        fft_threshold_ratio: float, threshold ratio for FFT denoising
+    Returns:
+        processed_segments: List of numpy arrays, EEMD-denoised signal segments
+    """
+    processed_segments = []
+    eemd = EEMD()
+    eemd.trials = 50  # Number of ensemble trials for EEMD (balances stability and speed)
+
+    for i, seg in enumerate(segments):
+        print(f"\rProcessing segment {i + 1}/{len(segments)} with EEMD...", end="")
+        # Step 1: Center the signal (remove DC component)
+        seg_centered = seg - np.mean(seg)
+        # Step 2: Perform EEMD decomposition
+        IMFs = eemd.eemd(seg_centered)
+        # Step 3: Remove the 1st IMF (dominated by high-frequency noise)
+        filtered_emd = seg_centered - IMFs[0]
+        # Step 4: Apply FFT denoising to further reduce residual noise
+        denoised_signal = fft_denoise(filtered_emd, threshold_ratio=fft_threshold_ratio)
+        processed_segments.append(denoised_signal)
+
+    print("\nEEMD processing completed.")
+    return processed_segments
+
+
+def calculate_metrics(true_segments, pred_segments, method_name):
+    """
+    Calculate evaluation metrics for denoising performance:
+    Correlation Coefficient, MAE, MSE, Amplitude Error (%)
+    Args:
+        true_segments: List of numpy arrays, ideal noise-free signals (ground truth)
+        pred_segments: List of numpy arrays, denoised signals
+        method_name: str, name of the denoising method (for log printing)
+    Returns:
+        metrics: Dictionary, computed evaluation metrics
+    """
+    print(f"\n--- {method_name} ---")
+    # Flatten segment lists into 1D arrays for metric calculation
+    true_flat = np.concatenate(true_segments)
+    pred_flat = np.concatenate(pred_segments)
+
+    # Ensure equal length of true and predicted signals
+    min_len = min(len(true_flat), len(pred_flat))
+    true_flat, pred_flat = true_flat[:min_len], pred_flat[:min_len]
+
+    # 1. Pearson Correlation Coefficient (measures linear similarity, 1 = perfect match)
+    if np.std(true_flat) == 0 or np.std(pred_flat) == 0:
+        corr = np.nan  # Avoid division by zero (meaningless for constant signals)
+    else:
+        corr, _ = pearsonr(true_flat, pred_flat)
+
+    # 2. Mean Absolute Error (MAE, measures average absolute deviation)
+    mae = np.mean(np.abs(true_flat - pred_flat))
+
+    # 3. Mean Squared Error (MSE, penalizes large errors more heavily)
+    mse = np.mean((true_flat - pred_flat) ** 2)
+
+    # 4. Amplitude Error (%) (normalized MAE by average absolute amplitude of ground truth)
+    mean_abs_true = np.mean(np.abs(true_flat))
+    amplitude_error = (mae / mean_abs_true if mean_abs_true > 1e-9 else np.inf) * 100
+
+    # Print metrics
+    metrics = {
+        "Correlation": corr,
+        "MAE": mae,
+        "MSE": mse,
+        "Amplitude Error (%)": amplitude_error
+    }
+    for k, v in metrics.items():
+        print(f"{k}: {v:.4f}")
+
+    return metrics
+
+
+# =============================================================================
+# 3. Main Execution
+# =============================================================================
+if __name__ == "__main__":
+    print("=" * 70)
+    print("EEMD Denoising for Simulated Test Set (Based on Real Heartbeat Data)")
+    print("=" * 70)
+
+    # --- Step 1: Load Real Heartbeat Data and Generate Simulated Test Set ---
+    print("\n[Step 1: Load Real Heartbeat Data & Generate Simulated Test Set]")
+    try:
+        # Load raw real heartbeat data (shape: [number_of_segments, samples_per_segment])
+        real_heartbeats_raw = np.load(new_test_set_file)
+        print(
+            f"Successfully loaded real heartbeat data: {real_heartbeats_raw.shape[0]} segments, {real_heartbeats_raw.shape[1]} samples per segment")
+
+        # Extract first TEST_SEGMENT_NUM segments and truncate to fixed length (reduce computation)
+        samples_per_segment = 1000  # Fixed length per segment (10s @ 100Hz)
+        real_heartbeats_truncated = real_heartbeats_raw[:TEST_SEGMENT_NUM, :samples_per_segment]
+        print(
+            f"Extracted first {TEST_SEGMENT_NUM} segments (each truncated to {samples_per_segment} samples) for test set")
+
+        # Generate ideal noise-free signals (ground truth for evaluation)
+        ideal_test_segments = [real_heartbeats_truncated[i, :] for i in range(TEST_SEGMENT_NUM)]
+
+        # Generate noisy test set (simulate real-world noisy signals for EEMD denoising)
+        noisy_test_segments = []
+        for ideal_seg in ideal_test_segments:
+            noisy_seg = ideal_seg + NOISE_AMOUNT * np.random.randn(len(ideal_seg))
+            noisy_test_segments.append(noisy_seg)
+
+        print(
+            f"Simulated test set generated: {len(noisy_test_segments)} noisy segments (Gaussian noise intensity: {NOISE_AMOUNT})")
+
+    except Exception as e:
+        print(f"Error loading real heartbeat data or generating test set: {str(e)}")
+        exit()
+
+    # --- Step 2: Apply EEMD Denoising to the Noisy Test Set ---
+    print("\n[Step 2: Apply EEMD Denoising to Noisy Test Set]")
+    eemd_denoised_segments = apply_eemd_pipeline(
+        segments=noisy_test_segments,
+        fft_threshold_ratio=FFT_DENOISE_THRESHOLD_RATIO
+    )
+
+    # --- Step 3: Evaluate EEMD Denoising Performance ---
+    print("\n[Step 3: Evaluate EEMD Denoising Performance]")
+    metrics_eemd = calculate_metrics(
+        true_segments=ideal_test_segments,
+        pred_segments=eemd_denoised_segments,
+        method_name="EEMD Denoising Performance (Simulated Test Set)"
+    )
+
+    # --- Step 4: Visualize Denoising Results ---
+    print("\n[Step 4: Visualize EEMD Denoising Results]")
+    plot_idx = 10  # Index of the segment to visualize (0 ~ TEST_SEGMENT_NUM-1)
+
+    if len(ideal_test_segments) > plot_idx and len(noisy_test_segments) > plot_idx and len(
+            eemd_denoised_segments) > plot_idx:
+        # Create time axis (unit: seconds)
+        time_axis = np.arange(len(ideal_test_segments[plot_idx])) / fs
+
+        # Plot comparison
+        plt.figure(figsize=(18, 8))
+        # Plot 1: Ideal noise-free signal (ground truth)
+        plt.plot(time_axis, ideal_test_segments[plot_idx],
+                 label='Original Signal (Ground Truth)',
+                 color='red', linewidth=2.5, alpha=0.8)
+        # Plot 3: EEMD-denoised signal (output of EEMD)
+        plt.plot(time_axis, eemd_denoised_segments[plot_idx],
+                 label=f'EEMD Denoised Signal (Corr={metrics_eemd["Correlation"]:.3f})',
+                 color='green', linewidth=2, linestyle='-.')
+
+        # Plot settings
+        plt.title(f'EEMD Denoising Result Comparison (Test Set Segment #{plot_idx})', fontsize=16)
+        plt.xlabel('Time (s)', fontsize=12)
+        plt.ylabel('Amplitude', fontsize=12)
+        plt.legend(fontsize=11)
+        plt.grid(True, alpha=0.5)
+        plt.tight_layout()
+        plt.show()
+
+    else:
+        # Fallback: Visualize the first segment if specified index is out of range
+        plot_idx_fallback = 0
+        time_axis = np.arange(len(ideal_test_segments[plot_idx_fallback])) / fs
+
+        plt.figure(figsize=(18, 8))
+        plt.plot(time_axis, ideal_test_segments[plot_idx_fallback],
+                 label='Original Signal (Ground Truth)',
+                 color='red', linewidth=2.5, alpha=0.8)
+        plt.plot(time_axis, eemd_denoised_segments[plot_idx_fallback],
+                 label='EEMD Denoised Signal',
+                 color='green', linewidth=2, linestyle='-.')
+
+        plt.title(f'EEMD Denoising Result Comparison (Fallback: Segment #{plot_idx_fallback})', fontsize=16)
+        plt.xlabel('Time (s)', fontsize=12)
+        plt.ylabel('Amplitude', fontsize=12)
+        plt.legend(fontsize=11)
+        plt.grid(True, alpha=0.5)
+        plt.tight_layout()
+        plt.show()
+        print(f"Warning: Specified plot index {plot_idx} is out of range. Fallback to segment #{plot_idx_fallback}.")
+
+    print("\n" + "=" * 70)
+    print("EEMD Denoising Process Completed")
+    print("=" * 70)
