@@ -3,27 +3,18 @@ from scipy import signal
 from scipy.fft import fft, ifft, fftfreq
 from scipy.stats import pearsonr
 import matplotlib.pyplot as plt
-import pywt
-from PyEMD import CEEMDAN
 import os
+from sklearn.metrics import mean_squared_error # 导入 RMSE 计算
 
 # =============================================================================
-# 1. Core Configuration (Exponential Attenuation Parameters + Data Paths)
+# 1. Core Configuration
 # =============================================================================
 SAMPLING_RATE = 100
 CHANNEL_TO_ANALYZE = 0
 SAMPLES_PER_SEGMENT = 1000
 
-# --- Denoising Method ---
-DENOISING_METHOD = 'none'
-
-# --- Filter Parameters ---
-LOWCUT_FREQ = 4.5
-HIGHCUT_FREQ = 9.5
-FILTER_ORDER = 5
-
-# --- Equalization Parameters ---
-GAMMA_CANDIDATES = [0.3, 0.35]
+# --- 固定 Gamma 值 ---
+FIXED_GAMMA = 0.35 # <--- 固定 Gamma 值
 BEST_CUTOFF_HZ = 15.0
 
 # --- Exponential Attenuation Parameters ---
@@ -34,6 +25,17 @@ RANDOM_SEED = 42
 # --- Noise Parameters ---
 FIXED_NOISE_STD = 0.05
 
+# --- Metric Configuration ---
+CROP_LENGTH = 800
+CLIP_THRESHOLD_STD_FACTOR = 20 # 裁剪阈值因子
+MAIN_PEAK_WINDOW_SEC = 0.75 # <<<--- 时间窗口半径 (秒) 
+
+# --- Peak Finding Parameters ---
+SAVGOL_WINDOW = 11
+SAVGOL_POLY = 3
+PEAK_PROMINENCE_STD_FACTOR = 0.1
+PEAK_MIN_DISTANCE_SEC = 0.1
+
 # --- Data File Paths ---
 TRAIN_ON_BED_RAW_FILE = r"./data/vibration_analysis.npy"
 TRAIN_UNDER_BED_SAVE_FILE = "train_under_bed_exponential_attenuation.npy"
@@ -42,425 +44,498 @@ TEST_UNDER_BED_SAVE_FILE = "test_under_bed_exponential_attenuation.npy"
 
 
 # =============================================================================
-# 2. Core Helper Functions (All functions remain the same)
+# 2. Core Helper Functions
 # =============================================================================
-
-def load_and_segment_signal(file_path, segment_len, samples_to_remove=1):
-    if not os.path.exists(file_path):
-        raise FileNotFoundError(f"Signal file not found: {file_path}")
-    raw_data = np.load(file_path)
-    print(f"\nLoading signal file: {os.path.basename(file_path)}, original shape: {raw_data.shape}")
-    if raw_data.ndim == 1:
-        num_segments = len(raw_data) // segment_len
-        segmented_data = [raw_data[i * segment_len: (i + 1) * segment_len] for i in range(num_segments)]
+def load_and_segment_signal(file_path, segment_len, samples_to_remove=0):
+    if not os.path.exists(file_path): raise FileNotFoundError(f"Signal file not found: {file_path}")
+    raw_data = np.load(file_path); print(f"\nLoading signal file: {os.path.basename(file_path)}, original shape: {raw_data.shape}")
+    if raw_data.ndim == 2 and raw_data.shape[1] > segment_len: print(f"Warning: Signal columns ({raw_data.shape[1]}) > target length ({segment_len}). Cropping."); raw_data = raw_data[:, :segment_len]
+    if raw_data.ndim == 1: num_segments = len(raw_data) // segment_len; segmented_data = [raw_data[i * segment_len: (i + 1) * segment_len] for i in range(num_segments)]
     elif raw_data.ndim == 2:
-        if raw_data.shape[1] != segment_len:
-            print(
-                f"Warning: Signal columns ({raw_data.shape[1]}) != target length ({segment_len}). Slicing for channel {CHANNEL_TO_ANALYZE}.")
-            start_col = CHANNEL_TO_ANALYZE * segment_len
-            end_col = (CHANNEL_TO_ANALYZE + 1) * segment_len
-            if end_col > raw_data.shape[1]:
-                raise ValueError(
-                    f"Channel slicing out of bounds: signal has {raw_data.shape[1]} cols, require {end_col}.")
-            raw_data = raw_data[:, start_col:end_col]
-        segmented_data = [row for row in raw_data if len(row) == segment_len]
-    else:
-        raise ValueError(f"Unsupported signal dimension: {raw_data.ndim} (only 1D/2D supported).")
-    processed_segments = []
-    for seg in segmented_data:
-        if len(seg) > 2 * samples_to_remove:
-            processed_segments.append(seg[samples_to_remove:-samples_to_remove])
-        else:
-            processed_segments.append(seg)
-    print(f"Signal processing complete: {len(processed_segments)} segments, {len(processed_segments[0])} samples each.")
-    return processed_segments
-
+        if raw_data.shape[1] != segment_len: raise ValueError(f"Loaded data has {raw_data.shape[1]} columns but expected {segment_len}.")
+        segmented_data = [row for row in raw_data]
+    else: raise ValueError(f"Unsupported signal dimension: {raw_data.ndim}")
+    if samples_to_remove > 0: processed_segments = [seg[samples_to_remove:-samples_to_remove] for seg in segmented_data if len(seg) > 2 * samples_to_remove]
+    else: processed_segments = segmented_data
+    print(f"Signal processing complete: {len(processed_segments)} segments."); return processed_segments
 
 def generate_under_bed_signals(on_bed_segments, fs, save_path):
-    np.random.seed(RANDOM_SEED)
-    under_bed_segments = []
+    np.random.seed(RANDOM_SEED); under_bed_segments = []
+    print("\nGenerating signals with LINEAR attenuation...")
     for i, on_bed_seg in enumerate(on_bed_segments):
-        n = len(on_bed_seg)
-        signal_fft = fft(on_bed_seg)
-        freqs = fftfreq(n, 1 / fs)
+        n = len(on_bed_seg); signal_fft = fft(on_bed_seg); freqs = fftfreq(n, 1 / fs)
         attenuation_curve = np.exp(-(np.abs(freqs) / CORNER_FREQ) * ATTENUATION_FACTOR)
-        signal_fft_attenuated = signal_fft * attenuation_curve
-        attenuated_seg = np.real(ifft(signal_fft_attenuated))
-        noise = FIXED_NOISE_STD * np.random.randn(len(attenuated_seg))
-        noisy_attenuated_seg = attenuated_seg + noise
-        under_bed_segments.append(noisy_attenuated_seg)
-        print(f"\rGenerating under-bed signals: {i + 1}/{len(on_bed_segments)} segments", end="")
-    under_bed_np = np.array(under_bed_segments)
-    np.save(save_path, under_bed_np)
-    print(f"\nUnder-bed signals saved: {save_path}, shape: {under_bed_np.shape}")
-    return under_bed_segments
-
+        signal_fft_attenuated = signal_fft * attenuation_curve; attenuated_seg = np.real(ifft(signal_fft_attenuated))
+        noise = FIXED_NOISE_STD * np.random.randn(len(attenuated_seg)); noisy_attenuated_seg = attenuated_seg + noise
+        under_bed_segments.append(noisy_attenuated_seg); print(f"\rGenerating under-bed signals: {i + 1}/{len(on_bed_segments)} segments", end="")
+    under_bed_np = np.array(under_bed_segments); np.save(save_path, under_bed_np)
+    print(f"\nUnder-bed signals saved: {save_path}, shape: {under_bed_np.shape}"); return under_bed_segments
 
 def align_segments_cross_correlation(signal_ref, signal_target, max_lag_samples=100):
-    min_len = min(len(signal_ref), len(signal_target))
-    ref, target = signal_ref[:min_len], signal_target[:min_len]
-    corr = signal.correlate(target, ref, mode='full')
-    lags = signal.correlation_lags(min_len, min_len, mode='full')
+    min_len = min(len(signal_ref), len(signal_target)); ref, target = signal_ref[:min_len], signal_target[:min_len]
+    try: corr = signal.correlate(target, ref, mode='full'); lags = signal.correlation_lags(min_len, min_len, mode='full')
+    except ValueError: return ref, target, 0
+    if len(lags) == 0: return ref, target, 0
     lag = lags[np.argmax(corr)]
-    if abs(lag) > max_lag_samples:
-        lag = np.sign(lag) * max_lag_samples
-    if lag > 0:
-        ref, target = ref[:-lag], target[lag:]
-    elif lag < 0:
-        ref, target = ref[abs(lag):], target[:-abs(lag)]
-    final_len = min(len(ref), len(target))
-    return ref[:final_len], target[:final_len], lag
-
+    if abs(lag) > max_lag_samples: lag = np.sign(lag) * max_lag_samples
+    if lag > 0: ref, target = ref[:-lag], target[lag:]
+    elif lag < 0: ref, target = ref[abs(lag):], target[:-abs(lag)]
+    final_len = min(len(ref), len(target)); return ref[:final_len], target[:final_len], lag
 
 def align_with_fixed_lag(signal_ref, signal_target, lag):
-    if lag > 0:
-        ref_aligned, target_aligned = signal_ref[:-lag], signal_target[lag:]
-    elif lag < 0:
-        ref_aligned, target_aligned = signal_ref[abs(lag):], signal_target[:-abs(lag)]
-    else:
-        ref_aligned, target_aligned = signal_ref, signal_target
-    min_len = min(len(ref_aligned), len(target_aligned))
-    return ref_aligned[:min_len], target_aligned[:min_len]
-
-
-def butter_bandpass(low, high, fs, order=5):
-    nyquist = 0.5 * fs
-    b, a = signal.butter(order, [low / nyquist, high / nyquist], btype='band')
-    return b, a
-
-
-def bandpass_filter_segments(segments, low, high, fs, order=5):
-    if not segments:
-        return []
-    b, a = butter_bandpass(low, high, fs, order=order)
-    return [signal.filtfilt(b, a, seg) for seg in segments]
-
-
-def denoise_signal_wavelet(signal_data, wavelet='sym8', level=4):
-    if not isinstance(signal_data, np.ndarray):
-        signal_data = np.array(signal_data)
-    max_possible_level = pywt.dwtn_max_level(signal_data.shape, pywt.Wavelet(wavelet))
-    level = min(level, max_possible_level)
-    if level < 1:
-        return signal_data
-    coeffs = pywt.wavedec(signal_data, wavelet, level=level)
-    sigma = np.median(np.abs(coeffs[-1])) / 0.6745
-    if sigma == 0:
-        return signal_data
-    threshold = sigma * np.sqrt(2 * np.log(len(signal_data)))
-    new_coeffs = [coeffs[0]]
-    for i in range(1, len(coeffs)):
-        new_coeffs.append(pywt.threshold(coeffs[i], threshold, mode='soft'))
-    denoised_signal = pywt.waverec(new_coeffs, wavelet)
-    return denoised_signal[:len(signal_data)]
-
-
-def denoise_signal_ceemdan(signal_data, noise_imfs_to_remove=1):
-    if not isinstance(signal_data, np.ndarray):
-        signal_data = np.array(signal_data)
-    ceemdan = CEEMDAN()
-    imfs = ceemdan(signal_data.astype(np.float64))
-    if imfs.shape[0] > noise_imfs_to_remove:
-        denoised_signal = np.sum(imfs[noise_imfs_to_remove:], axis=0)
-    else:
-        denoised_signal = imfs[-1] if imfs.shape[0] > 0 else np.zeros_like(signal_data)
-    return denoised_signal
-
+    if lag > 0: ref_aligned, target_aligned = signal_ref[:-lag], signal_target[lag:]
+    elif lag < 0: ref_aligned, target_aligned = signal_ref[abs(lag):], signal_target[:-abs(lag)]
+    else: ref_aligned, target_aligned = signal_ref, signal_target
+    min_len = min(len(ref_aligned), len(target_aligned)); return ref_aligned[:min_len], target_aligned[:min_len]
 
 def estimate_frf_for_phase(input_segments, output_segments, fs):
     min_len_list = [len(s) for s in input_segments if len(s) > 0] + [len(s) for s in output_segments if len(s) > 0]
-    if not min_len_list:
-        return np.array([]), np.array([])
-    min_len = min(min_len_list)
-    if min_len == 0:
-        return np.array([]), np.array([])
+    if not min_len_list: return np.array([]), np.array([])
+    min_len = min(min_len_list);
+    if min_len < 2: return np.array([]), np.array([])
     nfft = int(2 ** np.floor(np.log2(min_len)))
-    S_xy_sum, S_xx_sum = np.zeros(nfft // 2 + 1, dtype=complex), np.zeros(nfft // 2 + 1, dtype=complex)
-    valid_pairs = 0
+    if nfft < 2: return np.array([]), np.array([])
+    S_xy_sum, S_xx_sum = np.zeros(nfft // 2 + 1, dtype=complex), np.zeros(nfft // 2 + 1, dtype=complex); valid_pairs = 0
     for i in range(len(input_segments)):
-        if len(input_segments[i]) < min_len or len(output_segments[i]) < min_len:
-            continue
-        inp_seg, out_seg = input_segments[i][:min_len], output_segments[i][:min_len]
-        f, Pxy = signal.csd(out_seg, inp_seg, fs=fs, nperseg=nfft)
-        _, Pxx = signal.welch(inp_seg, fs=fs, nperseg=nfft)
-        S_xy_sum += Pxy
-        S_xx_sum += Pxx
-        valid_pairs += 1
-    if valid_pairs == 0:
-        return np.array([]), np.array([])
+        if len(input_segments[i]) < nfft or len(output_segments[i]) < nfft: continue
+        inp_seg, out_seg = input_segments[i][:nfft], output_segments[i][:nfft]
+        if np.std(inp_seg) < 1e-9 or np.std(out_seg) < 1e-9: continue
+        try:
+            f, Pxy = signal.csd(out_seg, inp_seg, fs=fs, nperseg=nfft); _, Pxx = signal.welch(inp_seg, fs=fs, nperseg=nfft)
+            if not np.all(np.isfinite(Pxy)) or not np.all(np.isfinite(Pxx)): continue
+            S_xy_sum += Pxy; S_xx_sum += Pxx; valid_pairs += 1
+        except ValueError: continue
+    if valid_pairs == 0: return np.array([]), np.array([])
     H1 = (S_xy_sum / valid_pairs) / (S_xx_sum / valid_pairs + 1e-9)
+    if not np.all(np.isfinite(H1)): return f, np.ones_like(H1)
     return f, H1
 
-
 def apply_hybrid_fft_model(input_segments, fs, gamma, cutoff_hz, frf_model_freqs, frf_model_H):
-    processed = []
-    for seg in input_segments:
-        if len(seg) == 0:
-            processed.append(np.array([]))
-            continue
-        n = len(seg)
-        seg_fft = fft(seg)
-        freqs = fftfreq(n, 1 / fs)
-        magnitude_curve = np.power(np.abs(freqs), gamma)
-        magnitude_curve[freqs == 0] = 1.0
-        freq_1hz_idx = np.abs(freqs - 1.0).argmin()
-        norm_factor = 1.0
-        if freq_1hz_idx > 0 and magnitude_curve[freq_1hz_idx] > 1e-9:
-            norm_factor = magnitude_curve[freq_1hz_idx]
-            magnitude_curve /= norm_factor
-        if norm_factor > 1e-9:
-            cutoff_gain = np.power(cutoff_hz, gamma) / norm_factor
-        else:
-            cutoff_gain = np.power(cutoff_hz, gamma)
-        magnitude_curve[np.abs(freqs) > cutoff_hz] = cutoff_gain
-        phase_response = np.interp(np.abs(freqs), frf_model_freqs, np.unwrap(np.angle(frf_model_H)), left=0, right=0)
-        H_hybrid = magnitude_curve * np.exp(1j * phase_response)
-        equalized_fft = seg_fft * H_hybrid
-        processed.append(np.real(ifft(equalized_fft)))
+    processed = []; num_bad_segments = 0
+    if len(frf_model_freqs) == 0 or len(frf_model_H) == 0: return [np.zeros_like(seg) if len(seg)>0 else np.array([]) for seg in input_segments]
+    unwrapped_angle = np.unwrap(np.angle(frf_model_H))
+    for i, seg in enumerate(input_segments):
+        if len(seg) == 0: processed.append(np.array([])); continue
+        n = len(seg); seg_fft = fft(seg); freqs = fftfreq(n, 1 / fs); abs_freqs = np.abs(freqs)
+        magnitude_curve = np.power(abs_freqs, gamma, where=abs_freqs > 1e-9, out=np.ones_like(abs_freqs)); magnitude_curve[freqs == 0] = 1.0
+        freq_1hz_idx = np.abs(freqs - 1.0).argmin(); norm_factor = 1.0
+        if freq_1hz_idx > 0 and magnitude_curve[freq_1hz_idx] > 1e-9: norm_factor = magnitude_curve[freq_1hz_idx]
+        if norm_factor > 1e-9: magnitude_curve /= norm_factor
+        else: norm_factor = 1.0
+        if norm_factor > 1e-9: cutoff_gain = np.power(cutoff_hz, gamma) / norm_factor
+        else: cutoff_gain = np.power(cutoff_hz, gamma)
+        magnitude_curve[abs_freqs > cutoff_hz] = cutoff_gain
+        phase_response = np.interp(abs_freqs, frf_model_freqs, unwrapped_angle, left=unwrapped_angle[0], right=unwrapped_angle[-1])
+        H_hybrid = magnitude_curve * np.exp(1j * phase_response); equalized_fft = seg_fft * H_hybrid
+        processed_seg = np.real(ifft(equalized_fft))
+        if not np.all(np.isfinite(processed_seg)): processed_seg = np.zeros_like(seg); num_bad_segments += 1
+        processed.append(processed_seg)
     return processed
 
+def get_peak_indices(seg, fs=100):
+    """ Finds peaks and troughs using smoothing, prominence, and distance. """
+    if seg is None or len(seg) < SAVGOL_WINDOW: return [], []
+    if not np.all(np.isfinite(seg)): return [], []
+    try: seg_smooth = signal.savgol_filter(seg, SAVGOL_WINDOW, SAVGOL_POLY, mode='mirror')
+    except ValueError: seg_smooth = seg
+    if not np.all(np.isfinite(seg_smooth)): return [], []
+    min_dist_samples = int(fs * PEAK_MIN_DISTANCE_SEC); std_seg = np.std(seg_smooth)
+    if not np.isfinite(std_seg) or std_seg < 1e-9: prominence = 1e-9
+    else: prominence = std_seg * PEAK_PROMINENCE_STD_FACTOR
+    if not np.isfinite(prominence) or prominence < 1e-9: prominence = 1e-9
+    try:
+        peaks, _ = signal.find_peaks(seg_smooth, prominence=prominence, distance=min_dist_samples)
+        troughs, _ = signal.find_peaks(-seg_smooth, prominence=prominence, distance=min_dist_samples)
+    except Exception as e: return [], []
+    return peaks, troughs
 
-def calculate_and_print_metrics(ground_truth, predicted, method_name):
-    print(f"\n--- {method_name} Final Evaluation Results ---")
-    valid_gt = [s for s in ground_truth if len(s) > 0]
-    valid_pred = [s for s in predicted if len(s) > 0]
-    if not valid_gt or not valid_pred:
-        print("Input list is empty or contains no valid segments, cannot evaluate.")
-        return {}
-    min_len = min([len(s) for s in valid_gt] + [len(s) for s in valid_pred])
-    if min_len == 0:
-        print("No segments with valid length to evaluate.")
-        return {}
-    true_flat = np.concatenate([s[:min_len] for s in valid_gt])
-    pred_flat = np.concatenate([s[:min_len] for s in valid_pred])
-    if true_flat.size == 0 or pred_flat.size == 0:
-        print("Concatenated arrays are empty, cannot evaluate.")
-        return {}
-    corr, _ = pearsonr(true_flat, pred_flat)
-    mae = np.mean(np.abs(true_flat - pred_flat))
-    mean_abs_true = np.mean(np.abs(true_flat))
-    amp_err = (mae / mean_abs_true) * 100 if mean_abs_true > 1e-9 else np.inf
-    metrics = {"Correlation": corr, "Mean Absolute Error (MAE)": mae, "Amplitude Error (%)": amp_err}
-    for key, value in metrics.items():
-        print(f"{key}: {value:.4f}")
-    return metrics
-
+def get_peak_to_peak_amplitudes(seg, fs=100):
+    """ Finds P-T amplitudes and corresponding indices based on the provided segment. """
+    peaks, troughs = get_peak_indices(seg, fs)
+    # 返回4个列表，即使没有找到峰谷也要返回空列表
+    amplitudes = []; peak_indices = []; trough_indices = []; original_indices = [] # Add original_indices init
+    if len(peaks) == 0 or len(troughs) == 0: return amplitudes, peak_indices, trough_indices, original_indices # Return 4 lists
+    extrema = [];
+    for i in peaks: extrema.append((i, seg[i], 'peak'))
+    for i in troughs: extrema.append((i, seg[i], 'trough'))
+    extrema.sort(key=lambda x: x[0]);
+    for i in range(1, len(extrema)):
+        if extrema[i][2] != extrema[i - 1][2]:
+            val1 = extrema[i][1]; val2 = extrema[i - 1][1]
+            if not np.isfinite(val1) or not np.isfinite(val2): continue
+            amp_diff = np.abs(val1 - val2)
+            if amp_diff > 1e-6:
+                original_indices.append(len(amplitudes)) # Store index before appending
+                amplitudes.append(amp_diff)
+                if extrema[i][2] == 'peak':
+                    peak_indices.append(extrema[i][0]); trough_indices.append(extrema[i - 1][0])
+                else:
+                    peak_indices.append(extrema[i - 1][0]); trough_indices.append(extrema[i][0])
+    return amplitudes, peak_indices, trough_indices, original_indices # Return 4 lists
 
 # =============================================================================
-# 3. Main Execution
+# 【版本 1 的核心指标计算函数 - Main P-T Amp Err - 带裁剪输出】
+# =============================================================================
+def calculate_metrics_core(true_flat_in, pred_flat_in, verbose_clipping=False): # 添加 verbose_clipping 参数
+    """
+    Calculates robust metrics including "Main P-T Amp Err (%)" based on
+    locally maximal P-T amplitudes in the true signal within a time window.
+    Includes input validation, value clipping, and optional clipping report.
+    """
+    metrics = {
+        "Correlation": np.nan,
+        "Mean Absolute Error (MAE)": np.nan,
+        "RMSE": np.nan,
+        "Main P-T Amp Err (%)": np.nan # 【基于时间窗口主峰指标】
+    }
+
+    # --- Input Validation ---
+    if true_flat_in is None or pred_flat_in is None or \
+       true_flat_in.size < SAVGOL_WINDOW or pred_flat_in.size < SAVGOL_WINDOW or \
+       not np.all(np.isfinite(true_flat_in)) or not np.all(np.isfinite(pred_flat_in)):
+        return metrics
+
+    min_len = min(len(true_flat_in), len(pred_flat_in))
+    true_flat_in = true_flat_in[:min_len]; pred_flat_in = pred_flat_in[:min_len]
+
+    # --- Value Clipping ---
+    mean_true = np.mean(true_flat_in); std_true = np.std(true_flat_in)
+    if not np.isfinite(std_true): std_true = 0
+    clip_lower = mean_true - CLIP_THRESHOLD_STD_FACTOR * max(std_true, 1e-6)
+    clip_upper = mean_true + CLIP_THRESHOLD_STD_FACTOR * max(std_true, 1e-6)
+
+    # --- 检查将被裁剪的点 ---
+    true_clip_lower_indices = np.where(true_flat_in < clip_lower)[0]
+    true_clip_upper_indices = np.where(true_flat_in > clip_upper)[0]
+    pred_clip_lower_indices = np.where(pred_flat_in < clip_lower)[0]
+    pred_clip_upper_indices = np.where(pred_flat_in > clip_upper)[0]
+    num_true_clipped = len(true_clip_lower_indices) + len(true_clip_upper_indices)
+    num_pred_clipped = len(pred_clip_lower_indices) + len(pred_clip_upper_indices)
+
+    # --- 修改：无论是否裁剪都打印报告头，如果没有裁剪则明确说明 ---
+    if verbose_clipping:
+        print(f"    Clipping Report: Bounds=[{clip_lower:.2f}, {clip_upper:.2f}] (Mean={mean_true:.2f}, Std={std_true:.2f})")
+        if num_true_clipped == 0 and num_pred_clipped == 0:
+            print("      No points clipped.")
+        else:
+            if num_true_clipped > 0: print(f"      True Signal: Clipped {num_true_clipped} points.")
+            if num_pred_clipped > 0: print(f"      Pred Signal: Clipped {num_pred_clipped} points.")
+
+    # --- 执行裁剪 ---
+    true_flat = np.clip(true_flat_in, clip_lower, clip_upper)
+    pred_flat = np.clip(pred_flat_in, clip_lower, clip_upper)
+
+    # --- Standard Global Metrics ---
+    std_true_clipped = np.std(true_flat); std_pred_clipped = np.std(pred_flat)
+    mae = np.mean(np.abs(true_flat - pred_flat)); rmse = np.sqrt(mean_squared_error(true_flat, pred_flat))
+    metrics["Mean Absolute Error (MAE)"] = mae; metrics["RMSE"] = rmse
+    if std_true_clipped < 1e-9 and std_pred_clipped < 1e-9: corr = 1.0
+    elif std_true_clipped < 1e-9 or std_pred_clipped < 1e-9: corr = 0.0
+    else:
+        try: corr, _ = pearsonr(true_flat, pred_flat);
+        except ValueError: corr = np.nan
+        if not np.isfinite(corr): corr = 0.0
+    metrics["Correlation"] = corr
+
+    # --- Main Peak-to-Trough Amplitude Comparison (Based on Local Window Max) ---
+    # Step 1: Find ALL P-T amps and indices in the (clipped) TRUE signal
+    result_pt = get_peak_to_peak_amplitudes(true_flat, fs=SAMPLING_RATE)
+    # 检查返回值的数量是否正确
+    if len(result_pt) != 4: return metrics
+    true_amps, true_peak_indices, true_trough_indices, _ = result_pt # 解包
+
+    if not true_amps: return metrics
+
+    # Step 2: Identify "Main" P-T amplitudes (locally maximal within MAIN_PEAK_WINDOW_SEC)
+    main_true_amps = []
+    main_true_peak_indices = []
+    main_true_trough_indices = []
+    window_radius_samples = int(MAIN_PEAK_WINDOW_SEC * SAMPLING_RATE)
+
+    if not true_amps: return metrics
+
+    # Ensure indices lists are numpy arrays for efficient operations
+    np_true_peak_indices = np.array(true_peak_indices)
+    np_true_trough_indices = np.array(true_trough_indices)
+    np_true_amps = np.array(true_amps)
+
+    if len(np_true_peak_indices) == 0 or len(np_true_trough_indices) == 0: return metrics # Check if arrays are empty
+    mid_indices = (np_true_peak_indices + np_true_trough_indices) / 2.0
+
+
+    added_indices_set = set() # Use a set to track added original indices efficiently
+
+    for i in range(len(true_amps)):
+        current_amp = np_true_amps[i]
+        current_mid_idx = mid_indices[i]
+        window_start_idx = current_mid_idx - window_radius_samples
+        window_end_idx = current_mid_idx + window_radius_samples
+        indices_in_window = np.where((mid_indices >= window_start_idx) & (mid_indices <= window_end_idx))[0]
+
+        is_local_max = False # Assume not max initially
+        if len(indices_in_window) > 0:
+             max_amp_in_window = np.max(np_true_amps[indices_in_window])
+             # Check if current_amp is close to the max_amp_in_window
+             if np.isclose(current_amp, max_amp_in_window, atol=1e-9):
+                  is_local_max = True
+
+        if is_local_max:
+            # Check if this original index i has already been added
+            if i not in added_indices_set:
+                main_true_amps.append(current_amp)
+                main_true_peak_indices.append(true_peak_indices[i])
+                main_true_trough_indices.append(true_trough_indices[i])
+                added_indices_set.add(i) # Mark original index i as added
+
+
+    if not main_true_amps: return metrics
+
+    # Step 3: Query predicted signal at the main peak/trough indices
+    matched_main_true_amps = []; matched_main_pred_amps = []
+    for i in range(len(main_true_amps)):
+        pk_idx = main_true_peak_indices[i]; tr_idx = main_true_trough_indices[i]
+        if pk_idx >= len(pred_flat) or tr_idx >= len(pred_flat) or pk_idx < 0 or tr_idx < 0: continue
+        true_main_amp_i = main_true_amps[i]
+        pred_peak_val = pred_flat[pk_idx]; pred_trough_val = pred_flat[tr_idx]
+        if not np.isfinite(pred_peak_val) or not np.isfinite(pred_trough_val): continue
+        pred_main_amp_i = np.abs(pred_peak_val - pred_trough_val)
+        matched_main_true_amps.append(true_main_amp_i); matched_main_pred_amps.append(pred_main_amp_i)
+
+    # Step 4: Calculate MAPE for the matched MAIN P-T amplitudes
+    if matched_main_true_amps:
+        true_arr = np.array(matched_main_true_amps); pred_arr = np.array(matched_main_pred_amps)
+        denominator = np.maximum(true_arr, 1e-9)
+        percent_errors = np.divide(np.abs(true_arr - pred_arr), denominator, out=np.zeros_like(denominator), where=denominator > 1e-9) * 100.0
+        valid_errors = percent_errors[np.isfinite(percent_errors)]
+        if valid_errors.size > 0: main_pt_amp_err = np.mean(valid_errors)
+        else: main_pt_amp_err = np.nan
+        metrics["Main P-T Amp Err (%)"] = main_pt_amp_err
+
+    return metrics
+# =============================================================================
+
+
+def calculate_and_print_metrics(ground_truth_list, predicted_list, method_name, crop_len=None):
+    title = f"\n--- {method_name} (Aggregate) Final Evaluation Results ---";
+    if crop_len: title += f" (Cropped to middle {crop_len} samples)"
+    print(title)
+    valid_pairs = [(gt, pred) for gt, pred in zip(ground_truth_list, predicted_list) if gt is not None and pred is not None and len(gt) > 0 and len(pred) > 0]
+    if not valid_pairs: print("Input list contains no valid pairs."); return {}
+    all_true_cropped = []; all_pred_cropped = []
+    for true_seg, pred_seg in valid_pairs:
+        true_aligned, pred_aligned = true_seg, pred_seg
+        min_len = min(len(true_aligned), len(pred_aligned)); true_aligned = true_aligned[:min_len]; pred_aligned = pred_aligned[:min_len]
+        if crop_len and min_len >= crop_len: start = (min_len - crop_len) // 2; end = start + crop_len; true_aligned = true_aligned[start:end]; pred_aligned = pred_aligned[start:end]
+        elif crop_len and min_len < crop_len: continue
+        if len(true_aligned) < SAVGOL_WINDOW: continue
+        all_true_cropped.append(true_aligned); all_pred_cropped.append(pred_aligned)
+    if not all_true_cropped: print("No valid segments remaining."); return {}
+    true_flat = np.concatenate(all_true_cropped); pred_flat = np.concatenate(all_pred_cropped)
+    # 调用核心函数，聚合时不打印裁剪信息 (verbose_clipping=False)
+    metrics = calculate_metrics_core(true_flat, pred_flat, verbose_clipping=False)
+    print(f"Correlation: {metrics['Correlation']:.4f}")
+    print(f"Mean Absolute Error (MAE): {metrics['Mean Absolute Error (MAE)']:.4f}")
+    print(f"RMSE: {metrics['RMSE']:.4f}")
+    print(f"Main P-T Amp Err (%): {metrics['Main P-T Amp Err (%)']:.4f}") # 使用 Main P-T Amp Err
+    return metrics
+
+def calculate_segment_metrics(ground_truth_seg, predicted_seg, crop_len=None):
+    if ground_truth_seg is None or predicted_seg is None or len(ground_truth_seg) == 0 or len(predicted_seg) == 0:
+        return {"Correlation": np.nan, "Mean Absolute Error (MAE)": np.nan, "RMSE": np.nan, "Main P-T Amp Err (%)": np.nan} # 使用 Main P-T Amp Err
+    true_flat, pred_flat = ground_truth_seg, predicted_seg
+    min_len = min(len(true_flat), len(pred_flat)); true_flat = true_flat[:min_len]; pred_flat = pred_flat[:min_len]
+    if crop_len and min_len >= crop_len:
+        start = (min_len - crop_len) // 2; end = start + crop_len
+        true_flat = true_flat[start:end]; pred_flat = pred_flat[start:end]
+    elif crop_len and min_len < crop_len:
+         return {"Correlation": np.nan, "Mean Absolute Error (MAE)": np.nan, "RMSE": np.nan, "Main P-T Amp Err (%)": np.nan} # 使用 Main P-T Amp Err
+    if len(true_flat) < SAVGOL_WINDOW:
+         return {"Correlation": np.nan, "Mean Absolute Error (MAE)": np.nan, "RMSE": np.nan, "Main P-T Amp Err (%)": np.nan} # 使用 Main P-T Amp Err
+    # 调用核心函数，计算分段时打印裁剪信息 (verbose_clipping=True)
+    return calculate_metrics_core(true_flat, pred_flat, verbose_clipping=True)
+
+# =============================================================================
+# 3. Main Execution (使用固定 Gamma, 评估 Main P-T Amp Err)
 # =============================================================================
 if __name__ == "__main__":
     plt.style.use('seaborn-v0_8-whitegrid')
     plt.rcParams['axes.unicode_minus'] = False
 
-    # --- Step 1 & 2: Load and Generate Data (Do this once) ---
-    print("=" * 70)
-    print("Step 1/2: Loading and Generating Data")
-    print("=" * 70)
-    train_on_bed_segments = load_and_segment_signal(file_path=TRAIN_ON_BED_RAW_FILE, segment_len=SAMPLES_PER_SEGMENT)
-    test_on_bed_segments = load_and_segment_signal(file_path=TEST_ON_BED_RAW_FILE, segment_len=SAMPLES_PER_SEGMENT)
-    if not os.path.exists(TRAIN_UNDER_BED_SAVE_FILE):
-        print("\nGenerating training set under-bed signals...")
-        generate_under_bed_signals(train_on_bed_segments, SAMPLING_RATE, TRAIN_UNDER_BED_SAVE_FILE)
-    if not os.path.exists(TEST_UNDER_BED_SAVE_FILE):
-        print("\nGenerating test set under-bed signals...")
-        generate_under_bed_signals(test_on_bed_segments, SAMPLING_RATE, TEST_UNDER_BED_SAVE_FILE)
-    train_under_bed_segments = [row for row in np.load(TRAIN_UNDER_BED_SAVE_FILE)]
-    test_under_bed_segments = [row for row in np.load(TEST_UNDER_BED_SAVE_FILE)]
+    print("=" * 70); print("Step 1/2: Loading and Generating Data"); print("=" * 70)
+    train_on_bed_segments_raw = load_and_segment_signal(file_path=TRAIN_ON_BED_RAW_FILE, segment_len=SAMPLES_PER_SEGMENT)
+    test_on_bed_segments_raw = load_and_segment_signal(file_path=TEST_ON_BED_RAW_FILE, segment_len=SAMPLES_PER_SEGMENT)
+    if not os.path.exists(TRAIN_UNDER_BED_SAVE_FILE): generate_under_bed_signals(train_on_bed_segments_raw, SAMPLING_RATE, TRAIN_UNDER_BED_SAVE_FILE)
+    if not os.path.exists(TEST_UNDER_BED_SAVE_FILE): generate_under_bed_signals(test_on_bed_segments_raw, SAMPLING_RATE, TEST_UNDER_BED_SAVE_FILE)
+    train_under_bed_segments_raw = load_and_segment_signal(file_path=TRAIN_UNDER_BED_SAVE_FILE, segment_len=SAMPLES_PER_SEGMENT)
+    test_under_bed_segments_raw = load_and_segment_signal(file_path=TEST_UNDER_BED_SAVE_FILE, segment_len=SAMPLES_PER_SEGMENT)
+    samples_to_remove = 1
+    train_on_bed_working = [s[samples_to_remove:-samples_to_remove] for s in train_on_bed_segments_raw]
+    train_under_bed_working = [s[samples_to_remove:-samples_to_remove] for s in train_under_bed_segments_raw]
+    test_on_bed_working = [s[samples_to_remove:-samples_to_remove] for s in test_on_bed_segments_raw]
+    test_under_bed_working = [s[samples_to_remove:-samples_to_remove] for s in test_under_bed_segments_raw]
 
-    # --- Step 4: Preprocessing (Gamma-Independent part, do this once) ---
-    print("\n" + "=" * 70)
-    print("Step 4: Performing Gamma-Independent Preprocessing")
-    print("=" * 70)
-    train_on_filtered = bandpass_filter_segments(train_on_bed_segments, LOWCUT_FREQ, HIGHCUT_FREQ, SAMPLING_RATE)
-    train_under_filtered = bandpass_filter_segments(train_under_bed_segments, LOWCUT_FREQ, HIGHCUT_FREQ, SAMPLING_RATE)
-    test_on_filtered = bandpass_filter_segments(test_on_bed_segments, LOWCUT_FREQ, HIGHCUT_FREQ, SAMPLING_RATE)
-    test_under_filtered = bandpass_filter_segments(test_under_bed_segments, LOWCUT_FREQ, HIGHCUT_FREQ, SAMPLING_RATE)
-
+    print("\n" + "=" * 70); print("Step 3: Aligning RAW (Unfiltered) Signals"); print("=" * 70)
     print("\nAligning training data and learning average lag...")
     train_on_aligned, train_under_aligned, lags_from_training = [], [], []
-    for i in range(min(len(train_on_filtered), len(train_under_filtered))):
-        o, u, lag = align_segments_cross_correlation(train_on_filtered[i], train_under_filtered[i])
-        train_on_aligned.append(o)
-        train_under_aligned.append(u)
-        lags_from_training.append(lag)
-    average_lag = int(np.round(np.mean(lags_from_training)))
-    print(f"Learned average lag from training set: {average_lag} samples.")
-
+    num_fail_align_train = 0
+    for i, (o, u) in enumerate(zip(train_on_bed_working, train_under_bed_working)):
+        if len(o) < 10 or len(u) < 10: o_a, u_a, lag = o, u, 0; num_fail_align_train += 1
+        else: o_a, u_a, lag = align_segments_cross_correlation(o, u);
+        if len(o_a) == 0: num_fail_align_train += 1
+        train_on_aligned.append(o_a); train_under_aligned.append(u_a); lags_from_training.append(lag)
+    valid_lags = [l for i, l in enumerate(lags_from_training) if len(train_on_aligned[i]) > 0]
+    average_lag = int(np.round(np.mean(valid_lags))) if valid_lags else 0
+    print(f"Learned average lag from {len(valid_lags)} valid segments: {average_lag} samples.")
     print("Aligning test data using the fixed average lag...")
     test_on_aligned, test_under_aligned = [], []
-    for i in range(min(len(test_on_filtered), len(test_under_filtered))):
-        o, u = align_with_fixed_lag(test_on_filtered[i], test_under_filtered[i], average_lag)
-        test_on_aligned.append(o)
-        test_under_aligned.append(u)
+    for o, u in zip(test_on_bed_working, test_under_bed_working): o_a, u_a = align_with_fixed_lag(o, u, average_lag); test_on_aligned.append(o_a); test_under_aligned.append(u_a)
 
-    # --- Step 5: Model Training (Gamma-Independent part, do this once) ---
-    print("\n" + "=" * 70)
-    print("Step 5: Training Gamma-Independent Phase Model")
-    print("=" * 70)
-    frf_freqs, frf_H = estimate_frf_for_phase(train_under_aligned, train_on_aligned, SAMPLING_RATE)
-    if len(frf_freqs) == 0:
-        raise ValueError("FRF model training failed, no valid segments.")
+    print("\n" + "=" * 70); print("Step 4: Training Phase Model on RAW data"); print("=" * 70)
+    valid_train_indices = [i for i, seg in enumerate(train_on_aligned) if len(seg) > 0]
+    frf_freqs, frf_H = estimate_frf_for_phase([train_under_aligned[i] for i in valid_train_indices], [train_on_aligned[i] for i in valid_train_indices], SAMPLING_RATE)
+    if len(frf_freqs) == 0: raise ValueError("FRF model training failed.")
     print("FRF phase model training complete.")
 
-    # --- Loop over Gamma Candidates ---
-    print("\n" + "=" * 70)
-    print("Step 5b: Looping Through Gamma Candidates for Evaluation")
-    print("=" * 70)
+    # --- Model Application & Scaling (Using FIXED_GAMMA) ---
+    print("\n" + "=" * 70); print(f"Step 5: Applying Model with Fixed Gamma = {FIXED_GAMMA}"); print("=" * 70)
+    train_under_hybrid = apply_hybrid_fft_model(train_under_aligned, SAMPLING_RATE, FIXED_GAMMA, BEST_CUTOFF_HZ, frf_freqs, frf_H)
+    test_under_hybrid = apply_hybrid_fft_model(test_under_aligned, SAMPLING_RATE, FIXED_GAMMA, BEST_CUTOFF_HZ, frf_freqs, frf_H)
+    # --- Robust Scaling ---
+    train_predicted = []; segment_scaling_factors = []; num_bad_train = 0
+    for i in range(len(train_under_hybrid)):
+        seg_hybrid = train_under_hybrid[i]; seg_target = train_on_aligned[i]
+        if len(seg_hybrid) < 2 or len(seg_target) < 2 or not np.all(np.isfinite(seg_hybrid)) or not np.all(np.isfinite(seg_target)): train_predicted.append(np.array([])); num_bad_train += 1; continue
+        std_input = np.std(seg_hybrid); std_target = np.std(seg_target); scaling_factor_seg = 1.0
+        if std_input > 1e-6 and std_target > 1e-6: scaling_factor_seg = std_target / std_input
+        scaling_factor_seg = np.clip(scaling_factor_seg, 0.01, 100.0)
+        if not np.isfinite(scaling_factor_seg): scaling_factor_seg = 1.0
+        scaled_seg = seg_hybrid * scaling_factor_seg
+        if not np.all(np.isfinite(scaled_seg)): train_predicted.append(np.zeros_like(scaled_seg)); num_bad_train += 1
+        else: train_predicted.append(scaled_seg); segment_scaling_factors.append(scaling_factor_seg)
+    avg_scaling_factor = np.mean(segment_scaling_factors) if segment_scaling_factors else 1.0
+    print(f"Calculated AVERAGE scaling factor for gamma={FIXED_GAMMA} from {len(segment_scaling_factors)} valid segments: {avg_scaling_factor:.4f}")
+    test_predicted = []; num_bad_test = 0
+    for i in range(len(test_under_hybrid)):
+         seg_hybrid_test = test_under_hybrid[i]
+         if len(seg_hybrid_test) < 2 or not np.all(np.isfinite(seg_hybrid_test)): test_predicted.append(np.array([])); num_bad_test += 1; continue
+         scaled_seg_test = seg_hybrid_test * avg_scaling_factor
+         if not np.all(np.isfinite(scaled_seg_test)): test_predicted.append(np.zeros_like(scaled_seg_test)); num_bad_test += 1
+         else: test_predicted.append(scaled_seg_test)
+    # --- End Scaling ---
 
-    results = []
-    for current_gamma in GAMMA_CANDIDATES:
-        print(f"\n----------- Testing Gamma = {current_gamma} -----------")
+    # --- Final Evaluation ---
+    print("\n" + "=" * 70); print(f"Step 6: Final Evaluation with Gamma = {FIXED_GAMMA}"); print("=" * 70)
+    print(f"\n--- Evaluating Training Set (Gamma = {FIXED_GAMMA}) vs. RAW ---")
+    train_metrics_agg = calculate_and_print_metrics(train_on_aligned, train_predicted, f"Training Set (Gamma = {FIXED_GAMMA}) vs. RAW", crop_len=CROP_LENGTH)
+    print(f"\n--- Evaluating Test Set (Gamma = {FIXED_GAMMA}) vs. RAW ---")
+    test_metrics_agg = calculate_and_print_metrics(test_on_aligned, test_predicted, f"Test Set (Gamma = {FIXED_GAMMA}) vs. RAW", crop_len=CROP_LENGTH)
 
-        # --- Gamma-DEPENDENT part of training/evaluation ---
-        train_under_hybrid = apply_hybrid_fft_model(
-            train_under_aligned, SAMPLING_RATE, current_gamma, BEST_CUTOFF_HZ, frf_freqs, frf_H
-        )
+    print("\n" + "=" * 50 + f" Step 6.5: Per-Segment Metrics (Gamma = {FIXED_GAMMA}, Cropped)" + "=" * 50)
+    all_train_metrics = []; all_test_metrics = []
+    # Train Metrics
+    for i in range(len(train_predicted)):
+        gt_seg = train_on_aligned[i] if i < len(train_on_aligned) else None; pred_seg = train_predicted[i]
+        metrics = calculate_segment_metrics(gt_seg, pred_seg, crop_len=CROP_LENGTH) # verbose_clipping=True is called inside
+        all_train_metrics.append(metrics)
+        corr_str = f"{metrics['Correlation']:.4f}" if np.isfinite(metrics['Correlation']) else "nan"; mae_str = f"{metrics['Mean Absolute Error (MAE)']:.4f}" if np.isfinite(metrics['Mean Absolute Error (MAE)']) else "nan"; rmse_str = f"{metrics['RMSE']:.4f}" if np.isfinite(metrics['RMSE']) else "nan"; main_pt_err_str = f"{metrics['Main P-T Amp Err (%)']:.2f}%" if np.isfinite(metrics['Main P-T Amp Err (%)']) else "nan%" # Use Main P-T Amp Err
+        print(f"  Train Segment #{i:03d}: Corr={corr_str}, MAE={mae_str}, RMSE={rmse_str}, Main P-T Amp Err={main_pt_err_str}") # Use Main P-T Amp Err
+    # Test Metrics
+    for i in range(len(test_predicted)):
+        gt_seg = test_on_aligned[i] if i < len(test_on_aligned) else None; pred_seg = test_predicted[i]
+        metrics = calculate_segment_metrics(gt_seg, pred_seg, crop_len=CROP_LENGTH) # verbose_clipping=True is called inside
+        all_test_metrics.append(metrics)
+        corr_str = f"{metrics['Correlation']:.4f}" if np.isfinite(metrics['Correlation']) else "nan"; mae_str = f"{metrics['Mean Absolute Error (MAE)']:.4f}" if np.isfinite(metrics['Mean Absolute Error (MAE)']) else "nan"; rmse_str = f"{metrics['RMSE']:.4f}" if np.isfinite(metrics['RMSE']) else "nan"; main_pt_err_str = f"{metrics['Main P-T Amp Err (%)']:.2f}%" if np.isfinite(metrics['Main P-T Amp Err (%)']) else "nan%" # Use Main P-T Amp Err
+        print(f"  Test Segment #{i:03d}: Corr={corr_str}, MAE={mae_str}, RMSE={rmse_str}, Main P-T Amp Err={main_pt_err_str}") # Use Main P-T Amp Err
 
-        valid_train_on = [s for s in train_on_aligned if len(s) > 0]
-        valid_train_reconstructed = [s for s in train_under_hybrid if len(s) > 0]
-        if not valid_train_on or not valid_train_reconstructed:
-            print(f"Skipping gamma={current_gamma} due to insufficient valid segments for scaling.")
-            continue
-
-        std_target = np.std(np.concatenate(valid_train_on))
-        std_input = np.std(np.concatenate(valid_train_reconstructed))
-        scaling_factor = std_target / std_input if std_input > 1e-9 else 1.0
-        print(f"Calculated scaling factor for gamma={current_gamma}: {scaling_factor:.4f}")
-
-        test_under_hybrid = apply_hybrid_fft_model(
-            test_under_aligned, SAMPLING_RATE, current_gamma, BEST_CUTOFF_HZ, frf_freqs, frf_H
-        )
-        test_predicted = [seg * scaling_factor for seg in test_under_hybrid]
-        test_metrics = calculate_and_print_metrics(
-            test_on_aligned, test_predicted, f"Test Set (gamma={current_gamma})"
-        )
-
-        if test_metrics:
-            results.append({'gamma': current_gamma, 'metrics': test_metrics})
-
-    # --- Find and Print the Best Gamma ---
-    print("\n" + "=" * 70)
-    print("Final Results Summary")
-    print("=" * 70)
-
-    if not results:
-        print("No valid results were obtained. Cannot determine the best gamma.")
-        # Exit or handle error appropriately
-        best_gamma_value = GAMMA_CANDIDATES[0]  # Fallback
-        best_metrics_value = {}
-    else:
-        best_result = min(results, key=lambda x: x['metrics'].get('Amplitude Error (%)', float('inf')))
-        best_gamma_value = best_result['gamma']
-        best_metrics_value = best_result['metrics']
-
-        print(f"\nOptimal Gamma Value found: {best_gamma_value}")
-        print("Performance on Test Set with this Gamma:")
-        for key, value in best_metrics_value.items():
-            print(f"  - {key}: {value:.4f}")
-
-    # --- Step 6: Visualize Reconstruction Results for the BEST Gamma ---
-    print("\n" + "=" * 70)
-    print(f"Step 6: Visualizing Results for Best Gamma = {best_gamma_value}")
-    print("=" * 70)
-
-    # Re-generate the predicted signals for the best gamma to plot them
-    train_under_hybrid_best = apply_hybrid_fft_model(train_under_aligned, SAMPLING_RATE, best_gamma_value,
-                                                     BEST_CUTOFF_HZ, frf_freqs, frf_H)
-    valid_train_reconstructed_best = [s for s in train_under_hybrid_best if len(s) > 0]
-    std_input_best = np.std(np.concatenate(valid_train_reconstructed_best))
-    scaling_factor_best = std_target / std_input_best if std_input_best > 1e-9 else 1.0
-
-    train_predicted_best = [seg * scaling_factor_best for seg in train_under_hybrid_best]
-    test_under_hybrid_best = apply_hybrid_fft_model(test_under_aligned, SAMPLING_RATE, best_gamma_value, BEST_CUTOFF_HZ,
-                                                    frf_freqs, frf_H)
-    test_predicted_best = [seg * scaling_factor_best for seg in test_under_hybrid_best]
-
-    # <<< NEW: Evaluate the best gamma on the training set as well for comparison >>>
-    print("\n--- Evaluating Best Gamma on Training Set ---")
-    train_metrics_best = calculate_and_print_metrics(
-        train_on_aligned, train_predicted_best, f"Training Set (Best Gamma = {best_gamma_value})"
-    )
-
-    # Training Set Visualization for Best Gamma
-    train_plot_idx = 5
-    if len(train_on_aligned) > train_plot_idx:
-        train_time = np.arange(len(train_on_aligned[train_plot_idx])) / SAMPLING_RATE
-        plt.figure(figsize=(20, 12))
-        plt.suptitle(f"Training Set Reconstruction (Best Gamma = {best_gamma_value})", fontsize=20, y=0.98)
-        plt.subplot(2, 1, 1)
-        plt.plot(train_time, train_on_aligned[train_plot_idx], label='Original On-Bed Signal', color='black',
-                 linewidth=2.5)
-        plt.plot(train_time, train_predicted_best[train_plot_idx], label='Reconstructed Signal', color='green',
-                 linewidth=2, alpha=0.9)
-        plt.plot(train_time, train_under_aligned[train_plot_idx], label='Attenuated Under-Bed Signal', color='blue',
-                 linewidth=1.5, alpha=0.7, linestyle='--')
-        plt.title('Full Time Series', fontsize=16)
-        plt.ylabel('Amplitude', fontsize=14)
-        plt.legend(fontsize=12)
-        plt.grid(True, linestyle='--', linewidth=0.5)
+    # --- Visualization ---
+    print("\n" + "=" * 70); print(f"Step 7: Visualizing Results for Gamma = {FIXED_GAMMA}"); print("=" * 70)
+    train_plot_idx = 120
+    if 0 <= train_plot_idx < len(train_on_aligned) and 0 <= train_plot_idx < len(train_predicted) and 0 <= train_plot_idx < len(train_under_aligned):
+        plot_truth = train_on_aligned[train_plot_idx]; plot_recon = train_predicted[train_plot_idx]; plot_atten = train_under_aligned[train_plot_idx]
+        plot_recon_valid = len(plot_recon) > 0 and np.all(np.isfinite(plot_recon)) and not np.all(plot_recon == 0)
+        plot_recon_display = plot_recon if plot_recon_valid else np.full_like(plot_truth, np.nan)
+        if not plot_recon_valid: print(f"\nNote: Training Segment #{train_plot_idx} is invalid.")
+        plt.figure(figsize=(20, 12)); plt.suptitle(f"Training Set Reconstruction (Gamma = {FIXED_GAMMA}) - Segment {train_plot_idx}", fontsize=20, y=0.98)
+        plt.subplot(2, 1, 1); plt.plot(plot_truth, label='Original Raw On-Bed Signal (Aligned)', color='black', linewidth=2.5); plt.plot(plot_recon_display, label='Reconstructed Signal (NaN if invalid)', color='green', linewidth=2, alpha=0.9); plt.plot(plot_atten, label='Original Raw Under-Bed Signal (Aligned)', color='blue', linewidth=1.5, alpha=0.7, linestyle='--'); plt.title('Full Time Series', fontsize=16); plt.ylabel('Amplitude', fontsize=14); plt.legend(fontsize=12); plt.grid(True, linestyle='--', linewidth=0.5)
         plt.subplot(2, 1, 2)
-        zoom_start, zoom_end = int(len(train_time) * 0.3), int(len(train_time) * 0.3) + int(5 * SAMPLING_RATE)
-        plt.plot(train_time[zoom_start:zoom_end], train_on_aligned[train_plot_idx][zoom_start:zoom_end],
-                 label='Original On-Bed Signal', color='black', linewidth=2.5)
-        plt.plot(train_time[zoom_start:zoom_end], train_predicted_best[train_plot_idx][zoom_start:zoom_end],
-                 label='Reconstructed Signal', color='green', linewidth=2, alpha=0.9)
-        plt.plot(train_time[zoom_start:zoom_end], train_under_aligned[train_plot_idx][zoom_start:zoom_end],
-                 label='Attenuated Under-Bed Signal', color='blue', linewidth=1.5, alpha=0.7, linestyle='--')
+        if len(plot_truth) >= CROP_LENGTH:
+            zoom_start = (len(plot_truth) - CROP_LENGTH) // 2; zoom_end = zoom_start + CROP_LENGTH; time_axis_zoom = np.arange(zoom_start, zoom_end)
+            plot_truth_zoom = plot_truth[zoom_start:zoom_end]; plot_recon_zoom = plot_recon_display[zoom_start:zoom_end]; plot_atten_zoom = plot_atten[zoom_start:zoom_end]
+            plt.plot(time_axis_zoom, plot_truth_zoom, label='Original Raw On-Bed Signal', color='black', linewidth=2.5); plt.plot(time_axis_zoom, plot_recon_zoom, label='Reconstructed Signal', color='green', linewidth=2, alpha=0.9); plt.plot(time_axis_zoom, plot_atten_zoom, label='Attenuated Under-Bed Signal', color='blue', linewidth=1.5, alpha=0.7, linestyle='--')
+            min_dist_samples_vis = int(SAMPLING_RATE * PEAK_MIN_DISTANCE_SEC)
+            try: truth_smooth_zoom = signal.savgol_filter(plot_truth_zoom, SAVGOL_WINDOW, SAVGOL_POLY, mode='mirror')
+            except ValueError: truth_smooth_zoom = plot_truth_zoom
+            std_true_zoom = np.std(truth_smooth_zoom); prominence_vis = 1e-6
+            if np.isfinite(std_true_zoom) and std_true_zoom > 1e-9: prominence_vis = std_true_zoom * PEAK_PROMINENCE_STD_FACTOR
+            if not np.isfinite(prominence_vis) or prominence_vis < 1e-9: prominence_vis = 1e-9
+            try:
+                zoomed_true_peaks, _ = signal.find_peaks(truth_smooth_zoom, prominence=prominence_vis, distance=min_dist_samples_vis)
+                zoomed_true_troughs, _ = signal.find_peaks(-truth_smooth_zoom, prominence=prominence_vis, distance=min_dist_samples_vis)
+                plt.scatter(time_axis_zoom[zoomed_true_peaks], plot_truth_zoom[zoomed_true_peaks], color='black', marker='o', s=50, label='True Peaks (Vis)', zorder=5)
+                plt.scatter(time_axis_zoom[zoomed_true_troughs], plot_truth_zoom[zoomed_true_troughs], color='black', marker='x', s=50, label='True Troughs (Vis)', zorder=5)
+            except Exception: pass
+            if plot_recon_valid:
+                 try: recon_smooth_zoom = signal.savgol_filter(plot_recon_zoom, SAVGOL_WINDOW, SAVGOL_POLY, mode='mirror')
+                 except ValueError: recon_smooth_zoom = plot_recon_zoom
+                 if np.all(np.isfinite(recon_smooth_zoom)):
+                      try:
+                           zoomed_pred_peaks, _ = signal.find_peaks(recon_smooth_zoom, prominence=prominence_vis, distance=min_dist_samples_vis)
+                           zoomed_pred_troughs, _ = signal.find_peaks(-recon_smooth_zoom, prominence=prominence_vis, distance=min_dist_samples_vis)
+                           plt.scatter(time_axis_zoom[zoomed_pred_peaks], plot_recon_zoom[zoomed_pred_peaks], color='lime', marker='o', s=30, alpha=0.7, label='Pred. Peaks (Vis)', zorder=4)
+                           plt.scatter(time_axis_zoom[zoomed_pred_troughs], plot_recon_zoom[zoomed_pred_troughs], color='lime', marker='x', s=30, alpha=0.7, label='Pred. Troughs (Vis)', zorder=4)
+                      except Exception: pass
+            if 0 <= train_plot_idx < len(all_train_metrics):
+                metrics = all_train_metrics[train_plot_idx]
+                corr_str = f"{metrics['Correlation']:.4f}" if np.isfinite(metrics['Correlation']) else "nan"; mae_str = f"{metrics['Mean Absolute Error (MAE)']:.4f}" if np.isfinite(metrics['Mean Absolute Error (MAE)']) else "nan"; rmse_str = f"{metrics['RMSE']:.4f}" if np.isfinite(metrics['RMSE']) else "nan"; main_pt_err_str = f"{metrics['Main P-T Amp Err (%)']:.2f}%" if np.isfinite(metrics['Main P-T Amp Err (%)']) else "nan%" # 使用 Main P-T Amp Err
+                metrics_text = f"Segment Metrics (Cropped):\nCorr: {corr_str}\nMAE: {mae_str}\nRMSE: {rmse_str}\nMain P-T Amp Err: {main_pt_err_str}" # 使用 Main P-T Amp Err
+                plt.text(0.02, 0.98, metrics_text, transform=plt.gca().transAxes, fontsize=11, verticalalignment='top', bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.8))
+            plt.title(f'Zoomed-in View (Middle {CROP_LENGTH} Samples)', fontsize=16); plt.xlabel('Sample Index'); plt.ylabel('Amplitude', fontsize=14); plt.legend(fontsize=10, loc='upper right'); plt.grid(True, linestyle='--', linewidth=0.5); plt.tight_layout(rect=[0, 0, 1, 0.95]); plt.show()
+        else: print(f"Skipping zoom plot for train segment {train_plot_idx}.")
+    else: print(f"Skipping train plot: Index {train_plot_idx} out of bounds.")
 
-        # <<< MODIFIED: Use the newly calculated best metrics for the plot text >>>
-        if train_metrics_best:
-            metric_text = f"Correlation: {train_metrics_best['Correlation']:.4f}\nMAE: {train_metrics_best['Mean Absolute Error (MAE)']:.4f}\nAmp Error: {train_metrics_best['Amplitude Error (%)']:.2f}%"
-            plt.text(0.02, 0.98, metric_text, transform=plt.gca().transAxes, fontsize=12, verticalalignment='top',
-                     bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.8))
-
-        plt.title('Zoomed-in View (5 seconds)', fontsize=16)
-        plt.xlabel('Time (s)', fontsize=14)
-        plt.ylabel('Amplitude', fontsize=14)
-        plt.legend(fontsize=12)
-        plt.grid(True, linestyle='--', linewidth=0.5)
-        plt.tight_layout(rect=[0, 0, 1, 0.95])
-        plt.show()
-
-    # Test Set Visualization for Best Gamma
-    test_plot_idx = 5
-    if len(test_on_aligned) > test_plot_idx:
-        test_time = np.arange(len(test_on_aligned[test_plot_idx])) / SAMPLING_RATE
-        plt.figure(figsize=(20, 12))
-        plt.suptitle(f"Test Set Reconstruction (Best Gamma = {best_gamma_value})", fontsize=20, y=0.98)
-        plt.subplot(2, 1, 1)
-        plt.plot(test_time, test_on_aligned[test_plot_idx], label='Original On-Bed Signal', color='darkred',
-                 linewidth=2.5)
-        plt.plot(test_time, test_predicted_best[test_plot_idx], label='Reconstructed Signal', color='darkgreen',
-                 linewidth=2, alpha=0.9)
-        plt.plot(test_time, test_under_aligned[test_plot_idx], label='Attenuated Under-Bed Signal', color='darkblue',
-                 linewidth=1.5, alpha=0.7, linestyle='--')
-        plt.title('Full Time Series', fontsize=16)
-        plt.ylabel('Amplitude', fontsize=14)
-        plt.legend(fontsize=12)
-        plt.grid(True, linestyle='--', linewidth=0.5)
+    test_plot_idx = 80
+    if 0 <= test_plot_idx < len(test_on_aligned) and 0 <= test_plot_idx < len(test_predicted) and 0 <= test_plot_idx < len(test_under_aligned):
+        plot_truth = test_on_aligned[test_plot_idx]; plot_recon = test_predicted[test_plot_idx]; plot_atten = test_under_aligned[test_plot_idx]
+        plot_recon_valid = len(plot_recon) > 0 and np.all(np.isfinite(plot_recon)) and not np.all(plot_recon == 0)
+        plot_recon_display = plot_recon if plot_recon_valid else np.full_like(plot_truth, np.nan)
+        if not plot_recon_valid: print(f"\nNote: Test Segment #{test_plot_idx} is invalid.")
+        plt.figure(figsize=(20, 12)); plt.suptitle(f"Test Set Reconstruction (Gamma = {FIXED_GAMMA}) - Segment {test_plot_idx}", fontsize=20, y=0.98)
+        plt.subplot(2, 1, 1); plt.plot(plot_truth, label='Original Raw On-Bed Signal (Aligned)', color='darkred', linewidth=2.5); plt.plot(plot_recon_display, label='Reconstructed Signal (NaN if invalid)', color='darkgreen', linewidth=2, alpha=0.9); plt.plot(plot_atten, label='Original Raw Under-Bed Signal (Aligned)', color='darkblue', linewidth=1.5, alpha=0.7, linestyle='--'); plt.title('Full Time Series', fontsize=16); plt.ylabel('Amplitude', fontsize=14); plt.legend(fontsize=12); plt.grid(True, linestyle='--', linewidth=0.5)
         plt.subplot(2, 1, 2)
-        zoom_start, zoom_end = int(len(test_time) * 0.3), int(len(test_time) * 0.3) + int(5 * SAMPLING_RATE)
+        if len(plot_truth) >= CROP_LENGTH:
+            zoom_start = (len(plot_truth) - CROP_LENGTH) // 2; zoom_end = zoom_start + CROP_LENGTH; time_axis_zoom = np.arange(zoom_start, zoom_end)
+            plot_truth_zoom = plot_truth[zoom_start:zoom_end]; plot_recon_zoom = plot_recon_display[zoom_start:zoom_end]; plot_atten_zoom = plot_atten[zoom_start:zoom_end]
+            plt.plot(time_axis_zoom, plot_truth_zoom, label='Original Raw On-Bed Signal', color='darkred', linewidth=2.5); plt.plot(time_axis_zoom, plot_recon_zoom, label='Reconstructed Signal', color='darkgreen', linewidth=2, alpha=0.9); plt.plot(time_axis_zoom, plot_atten_zoom, label='Attenuated Under-Bed Signal', color='darkblue', linewidth=1.5, alpha=0.7, linestyle='--')
+            min_dist_samples_vis = int(SAMPLING_RATE * PEAK_MIN_DISTANCE_SEC)
+            try: truth_smooth_zoom = signal.savgol_filter(plot_truth_zoom, SAVGOL_WINDOW, SAVGOL_POLY, mode='mirror')
+            except ValueError: truth_smooth_zoom = plot_truth_zoom
+            std_true_zoom = np.std(truth_smooth_zoom); prominence_vis = 1e-6
+            if np.isfinite(std_true_zoom) and std_true_zoom > 1e-9: prominence_vis = std_true_zoom * PEAK_PROMINENCE_STD_FACTOR
+            if not np.isfinite(prominence_vis) or prominence_vis < 1e-9: prominence_vis = 1e-9
+            try:
+                zoomed_true_peaks, _ = signal.find_peaks(truth_smooth_zoom, prominence=prominence_vis, distance=min_dist_samples_vis)
+                zoomed_true_troughs, _ = signal.find_peaks(-truth_smooth_zoom, prominence=prominence_vis, distance=min_dist_samples_vis)
+                plt.scatter(time_axis_zoom[zoomed_true_peaks], plot_truth_zoom[zoomed_true_peaks], color='black', marker='o', s=50, label='True Peaks (Vis)', zorder=5)
+                plt.scatter(time_axis_zoom[zoomed_true_troughs], plot_truth_zoom[zoomed_true_troughs], color='black', marker='x', s=50, label='True Troughs (Vis)', zorder=5)
+            except Exception: pass
+            if plot_recon_valid:
+                 try: recon_smooth_zoom = signal.savgol_filter(plot_recon_zoom, SAVGOL_WINDOW, SAVGOL_POLY, mode='mirror')
+                 except ValueError: recon_smooth_zoom = plot_recon_zoom
+                 if np.all(np.isfinite(recon_smooth_zoom)):
+                      try:
+                           zoomed_pred_peaks, _ = signal.find_peaks(recon_smooth_zoom, prominence=prominence_vis, distance=min_dist_samples_vis)
+                           zoomed_pred_troughs, _ = signal.find_peaks(-recon_smooth_zoom, prominence=prominence_vis, distance=min_dist_samples_vis)
+                           plt.scatter(time_axis_zoom[zoomed_pred_peaks], plot_recon_zoom[zoomed_pred_peaks], color='lime', marker='o', s=30, alpha=0.7, label='Pred. Peaks (Vis)', zorder=4)
+                           plt.scatter(time_axis_zoom[zoomed_pred_troughs], plot_recon_zoom[zoomed_pred_troughs], color='lime', marker='x', s=30, alpha=0.7, label='Pred. Troughs (Vis)', zorder=4)
+                      except Exception: pass
+            if 0 <= test_plot_idx < len(all_test_metrics):
+                metrics = all_test_metrics[test_plot_idx]
+                corr_str = f"{metrics['Correlation']:.4f}" if np.isfinite(metrics['Correlation']) else "nan"; mae_str = f"{metrics['Mean Absolute Error (MAE)']:.4f}" if np.isfinite(metrics['Mean Absolute Error (MAE)']) else "nan"; rmse_str = f"{metrics['RMSE']:.4f}" if np.isfinite(metrics['RMSE']) else "nan"; main_pt_err_str = f"{metrics['Main P-T Amp Err (%)']:.2f}%" if np.isfinite(metrics['Main P-T Amp Err (%)']) else "nan%" # 使用 Main P-T Amp Err
+                metrics_text = f"Segment Metrics (Cropped):\nCorr: {corr_str}\nMAE: {mae_str}\nRMSE: {rmse_str}\nMain P-T Amp Err: {main_pt_err_str}" # 使用 Main P-T Amp Err
+                plt.text(0.02, 0.98, metrics_text, transform=plt.gca().transAxes, fontsize=11, verticalalignment='top', bbox=dict(boxstyle='round', facecolor='lightblue', alpha=0.8))
+            plt.title(f'Zoomed-in View (Middle {CROP_LENGTH} Samples)', fontsize=16); plt.xlabel('Sample Index'); plt.ylabel('Amplitude', fontsize=14); plt.legend(fontsize=10, loc='upper right'); plt.grid(True, linestyle='--', linewidth=0.5); plt.tight_layout(rect=[0, 0, 1, 0.95]); plt.show()
+        else: print(f"Skipping zoom plot for test segment {test_plot_idx}.")
+    else: print(f"Skipping test plot: Index {test_plot_idx} out of bounds.")
 
-        if best_metrics_value:
-            metric_text = f"Correlation: {best_metrics_value['Correlation']:.4f}\nMAE: {best_metrics_value['Mean Absolute Error (MAE)']:.4f}\nAmp Error: {best_metrics_value['Amplitude Error (%)']:.2f}%"
-            plt.text(0.02, 0.98, metric_text, transform=plt.gca().transAxes, fontsize=12, verticalalignment='top',
-                     bbox=dict(boxstyle='round', facecolor='lightblue', alpha=0.8))
 
-        plt.plot(test_time[zoom_start:zoom_end], test_on_aligned[test_plot_idx][zoom_start:zoom_end],
-                 label='Original On-Bed Signal', color='darkred', linewidth=2.5)
-        plt.plot(test_time[zoom_start:zoom_end], test_predicted_best[test_plot_idx][zoom_start:zoom_end],
-                 label='Reconstructed Signal', color='darkgreen', linewidth=2, alpha=0.9)
-        plt.plot(test_time[zoom_start:zoom_end], test_under_aligned[test_plot_idx][zoom_start:zoom_end],
-                 label='Attenuated Under-Bed Signal', color='darkblue', linewidth=1.5, alpha=0.7, linestyle='--')
-        plt.title('Zoomed-in View (5 seconds)', fontsize=16)
-        plt.xlabel('Time (s)', fontsize=14)
-        plt.ylabel('Amplitude', fontsize=14)
-        plt.legend(fontsize=12)
-        plt.grid(True, linestyle='--', linewidth=0.5)
-        plt.tight_layout(rect=[0, 0, 1, 0.95])
-        plt.show()
-
-    print("\n" + "=" * 70)
-    print("All Processes Completed: Automated Gamma Search Finished")
-    print("=" * 70)
+    print("\n" + "=" * 70); print("All Processes Completed"); print("=" * 70)
