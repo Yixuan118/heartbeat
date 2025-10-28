@@ -20,7 +20,7 @@ LOWCUT_FREQ = 4.5
 HIGHCUT_FREQ = 9.5
 FILTER_ORDER = 5
 
-# --- [新] 简化的三次 Volterra 模型参数 (循环列表) ---
+# --- 三次 Volterra 模型参数 (循环列表) ---
 MODEL_NAME = "Volterra (3rd-Order Diag)"
 VOLTERRA_MEMORY_DEPTH_TO_TRY = [10, 15, 20, 25, 30]  # 尝试的 M 阶数
 ALPHA_VALUES_TO_TRY = [0.1, 1.0, 10.0, 100.0, 1000.0]  # 尝试的 Alpha 值
@@ -878,4 +878,5 @@ if __name__ == "__main__":
 
     print("\n" + "=" * 70);
     print("All Processes Completed");
+
     print("=" * 70)
